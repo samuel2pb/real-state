@@ -1,0 +1,45 @@
+{
+  "parent": { "type": "page_id", "page_id": "324ebb24-e70f-4796-a95b-2948c6fdd8cf" },
+  "title": [
+    { "type": "text", "text": { "content": "Rent Listings — São Paulo" } }
+  ],
+  "description": [
+    { "type": "text", "text": { "content": "Auto-populated by real-estate scraper (zapimoveis + quintoandar). See ExternalID + Source for uniqueness." } }
+  ],
+  "properties": {
+    "Name":         { "title": {} },
+    "URL":          { "url": {} },
+    "Source":       { "select": { "options": [
+      { "name": "zap",         "color": "orange" },
+      { "name": "quintoandar", "color": "yellow" }
+    ] } },
+    "ExternalID":   { "rich_text": {} },
+    "Status":       { "select": { "options": [
+      { "name": "available", "color": "green" },
+      { "name": "gone",      "color": "red"   }
+    ] } },
+    "Neighborhood": { "select": { "options": [
+      { "name": "Moema",                "color": "blue"   },
+      { "name": "Jardim Paulistano",    "color": "purple" },
+      { "name": "Jardim Paulista",      "color": "pink"   },
+      { "name": "Vila Nova Conceição",  "color": "brown"  },
+      { "name": "Campo Belo",           "color": "orange" },
+      { "name": "Brooklin",             "color": "yellow" },
+      { "name": "Itaim Bibi",           "color": "green"  },
+      { "name": "Vila Olímpia",         "color": "red"    },
+      { "name": "Pinheiros",            "color": "gray"   }
+    ] } },
+    "PriceRent":    { "number": { "format": "real" } },
+    "PriceTotal":   { "number": { "format": "real" } },
+    "Bedrooms":     { "number": { "format": "number" } },
+    "Bathrooms":    { "number": { "format": "number" } },
+    "Suites":       { "number": { "format": "number" } },
+    "Parking":      { "number": { "format": "number" } },
+    "Sqm":          { "number": { "format": "number" } },
+    "Pets":         { "checkbox": {} },
+    "DistanceKm":   { "number": { "format": "number_with_commas" } },
+    "Address":      { "rich_text": {} },
+    "FirstSeen":    { "date": {} },
+    "LastSeen":     { "date": {} }
+  }
+}

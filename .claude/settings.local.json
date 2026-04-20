@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl *)",
+      "Bash(python *)",
+      "Bash(cygpath -w /tmp/notion_db.json)",
+      "Bash(uv --version)",
+      "Bash(uv init *)",
+      "Bash(uv python *)",
+      "Bash(uv add *)",
+      "Bash(uv sync *)",
+      "Bash(uv run *)"
+    ]
+  }
+}
