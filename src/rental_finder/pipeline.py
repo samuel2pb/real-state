@@ -105,4 +105,7 @@ def run_rent_cycle() -> dict:
             store.mark_gone(alive["page_id"])
             stats["gone"] += 1
             log.info("marked_gone", id=f"{src_name}:{alive['external_id']}")
+        else:
+            store.touch_alive(alive["page_id"])
+            log.info("still_alive", id=f"{src_name}:{alive['external_id']}")
     return stats

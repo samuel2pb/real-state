@@ -164,6 +164,15 @@ class NotionStore:
             },
         )
 
+    def touch_alive(self, page_id: str) -> None:
+        _retry(
+            self.client.pages.update,
+            page_id=page_id,
+            properties={
+                "LastSeen": {"date": {"start": date.today().isoformat()}},
+            },
+        )
+
     def list_alive(self, kind: str = "rent") -> Iterator[dict]:
         ds_id = self._data_source_id(kind)
         cursor: str | None = None
