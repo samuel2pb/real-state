@@ -48,9 +48,21 @@ class Settings(BaseSettings):
     source_zapimoveis_buy_enabled: bool = True
     source_quintoandar_buy_enabled: bool = False
 
+    buy_city: str = "São Paulo"
+    buy_state: str = "SP"
     buy_neighborhoods: str = ""   # fallback to rent_neighborhoods if empty
     buy_price_min: int = 500000
     buy_price_max: int = 1200000
+    buy_condo_max: int = 0        # max monthly condo fee (0 = no cap)
+    buy_bedrooms_min: int = 2
+    buy_bedrooms_max: int = 3
+    buy_bathrooms_min: int = 2
+    buy_suites_min: int = 1
+    buy_sqm_min: int = 70
+    buy_parking_min: int = 1
+    buy_property_types: str = ""
+    buy_pets_required: bool = False
+    buy_furnished_allowed: bool = True
 
     work_address: str
     work_max_distance_km: float = 5.5

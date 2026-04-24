@@ -60,8 +60,16 @@ def _zap_unit_types() -> list[str]:
 
 
 def _zap_buy_unit_types() -> list[str]:
-    """Buy reuses RENT_PROPERTY_TYPES (same structural filters)."""
-    return _zap_unit_types()
+    """Resolve BUY_PROPERTY_TYPES to Zap unitTypes values."""
+    raw = settings.buy_property_types.strip()
+    if not raw:
+        return ["APARTMENT"]
+    types = []
+    for t in raw.split(","):
+        mapped = _ZAP_PROPERTY_TYPE_MAP.get(t.strip())
+        if mapped:
+            types.append(mapped)
+    return types or ["APARTMENT"]
 
 
 class ZapSource(Source):
@@ -182,8 +190,8 @@ class ZapSource(Source):
             ("categoryPage", "RESULT"),
             ("parentId", "null"),
             ("addressCountry", "Brasil"),
-            ("addressState", settings.rent_state),
-            ("addressCity", settings.rent_city),
+            ("addressState", settings.buy_state),
+            ("addressCity", settings.buy_city),
             ("addressType", "neighborhood"),
             ("addressLocationId", _location_id(neighborhood, zone)),
             ("addressNeighborhood", neighborhood),
@@ -191,19 +199,19 @@ class ZapSource(Source):
             ("usageTypes", "RESIDENTIAL"),
             ("priceMin", str(settings.buy_price_min)),
             ("priceMax", str(settings.buy_price_max)),
-            ("bedroomsMin", str(settings.rent_bedrooms_min)),
-            ("bedroomsMax", str(settings.rent_bedrooms_max)),
-            ("bathrooms", str(settings.rent_bathrooms_min)),
-            ("suites", str(settings.rent_suites_min)),
-            ("parkingSpaces", str(settings.rent_parking_min)),
-            ("usableAreasMin", str(settings.rent_sqm_min)),
+            ("bedroomsMin", str(settings.buy_bedrooms_min)),
+            ("bedroomsMax", str(settings.buy_bedrooms_max)),
+            ("bathrooms", str(settings.buy_bathrooms_min)),
+            ("suites", str(settings.buy_suites_min)),
+            ("parkingSpaces", str(settings.buy_parking_min)),
+            ("usableAreasMin", str(settings.buy_sqm_min)),
             ("from", str((page - 1) * size)),
             ("size", str(size)),
             ("page", str(page)),
             ("levels", "NEIGHBORHOOD"),
             ("sort", "pricing.price.price ASC"),
         ]
-        if settings.rent_pets_required:
+        if settings.buy_pets_required:
             p.append(("amenities", "PETS_ALLOWED"))
         return p
 
