@@ -43,6 +43,12 @@ class NotionStore:
                     "NOTION_RENT_DB_ID unset; run scripts/setup_notion.py"
                 )
             return settings.notion_rent_db_id
+        if kind == "buy":
+            if not settings.notion_buy_db_id:
+                raise RuntimeError(
+                    "NOTION_BUY_DB_ID unset; run scripts/setup_notion.py --kind buy"
+                )
+            return settings.notion_buy_db_id
         raise NotImplementedError(f"db kind {kind!r} not implemented yet")
 
     def _data_source_id(self, kind: str) -> str:
@@ -78,6 +84,38 @@ class NotionStore:
         return results[0]["id"] if results else None
 
     def _properties(self, lst: Listing) -> dict:
+        if lst.mode == "buy":
+            name = f"{lst.neighborhood} · {lst.bedrooms}BR · R$ {int(lst.price_sale):,}"
+            props = {
+                "Name": {"title": [{"text": {"content": name[:200]}}]},
+                "URL": {"url": lst.url},
+                "Source": {"select": {"name": lst.source}},
+                "ExternalID": {"rich_text": [{"text": {"content": lst.external_id}}]},
+                "Status": {"select": {"name": lst.status}},
+                "Neighborhood": {"select": {"name": lst.neighborhood}}
+                if lst.neighborhood
+                else {"select": None},
+                "Price": {"number": lst.price_sale},
+                "CondoFee": {"number": lst.condo_fee},
+                "Iptu": {"number": lst.iptu},
+                "Bedrooms": {"number": lst.bedrooms},
+                "Bathrooms": {"number": lst.bathrooms},
+                "Suites": {"number": lst.suites},
+                "Parking": {"number": lst.parking},
+                "Sqm": {"number": lst.sqm},
+                "Pets": {"checkbox": lst.pets},
+                "PropertyType": {"select": {"name": lst.property_type}}
+                if lst.property_type
+                else {"select": None},
+                "Address": {
+                    "rich_text": [{"text": {"content": (lst.address or "")[:1800]}}]
+                },
+                "LastSeen": {"date": {"start": lst.last_seen.isoformat()}},
+            }
+            if lst.distance_km is not None:
+                props["DistanceKm"] = {"number": round(lst.distance_km, 2)}
+            return props
+        # rent mode (default)
         name = f"{lst.neighborhood} · {lst.bedrooms}BR · R$ {int(lst.price_total)}"
         props = {
             "Name": {"title": [{"text": {"content": name[:200]}}]},

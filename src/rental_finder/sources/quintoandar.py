@@ -212,6 +212,11 @@ class QuintoAndarSource(Source):
                         lst.property_type = hi["type"]
                 yield lst
 
+    def search_buy(self, neighborhoods: list[str]) -> Iterator[Listing]:
+        # QuintoAndar buy not yet implemented; yields nothing.
+        return
+        yield  # noqa: unreachable — makes this a generator
+
     def check_alive(self, listing: Listing) -> bool:
         try:
             r = self.http.get(

@@ -5,11 +5,17 @@ from .quintoandar import QuintoAndarSource
 __all__ = ["Source", "ZapSource", "QuintoAndarSource"]
 
 
-def enabled_sources() -> list[Source]:
+def enabled_sources(mode: str = "rent") -> list[Source]:
     from ..config import settings
     out: list[Source] = []
-    if settings.source_zapimoveis_enabled:
-        out.append(ZapSource())
-    if settings.source_quintoandar_enabled:
-        out.append(QuintoAndarSource())
+    if mode == "buy":
+        if settings.source_zapimoveis_buy_enabled:
+            out.append(ZapSource())
+        if settings.source_quintoandar_buy_enabled:
+            out.append(QuintoAndarSource())
+    else:
+        if settings.source_zapimoveis_enabled:
+            out.append(ZapSource())
+        if settings.source_quintoandar_enabled:
+            out.append(QuintoAndarSource())
     return out

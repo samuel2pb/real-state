@@ -39,8 +39,8 @@ TITLES = {
 }
 
 
-def _schema() -> dict:
-    return {
+def _schema(kind: str = "rent") -> dict:
+    shared = {
         "Name": {"title": {}},
         "URL": {"url": {}},
         "Source": {
@@ -61,8 +61,6 @@ def _schema() -> dict:
             }
         },
         "Neighborhood": {"select": {"options": NEIGHBORHOOD_OPTIONS}},
-        "PriceRent": {"number": {"format": "real"}},
-        "PriceTotal": {"number": {"format": "real"}},
         "Bedrooms": {"number": {"format": "number"}},
         "Bathrooms": {"number": {"format": "number"}},
         "Suites": {"number": {"format": "number"}},
@@ -83,6 +81,14 @@ def _schema() -> dict:
         "FirstSeen": {"date": {}},
         "LastSeen": {"date": {}},
     }
+    if kind == "buy":
+        shared["Price"] = {"number": {"format": "real"}}
+        shared["CondoFee"] = {"number": {"format": "real"}}
+        shared["Iptu"] = {"number": {"format": "real"}}
+    else:
+        shared["PriceRent"] = {"number": {"format": "real"}}
+        shared["PriceTotal"] = {"number": {"format": "real"}}
+    return shared
 
 
 def main(kind: str = "rent") -> None:
@@ -94,7 +100,7 @@ def main(kind: str = "rent") -> None:
     db = c.databases.create(
         parent={"type": "page_id", "page_id": settings.notion_parent_page_id},
         title=[{"type": "text", "text": {"content": TITLES[kind]}}],
-        properties=_schema(),
+        properties=_schema(kind),
     )
     typer.echo(f"Created {kind} DB: {db['id']}")
     typer.echo(f"URL: {db.get('url')}")

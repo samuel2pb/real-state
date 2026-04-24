@@ -31,6 +31,15 @@ def run_once() -> None:
     typer.echo(stats)
 
 
+@app.command("run-buy-once")
+def run_buy_once() -> None:
+    """Run one full buy cycle (fetch + upsert + availability check)."""
+    _init_logging()
+    from .pipeline import run_buy_cycle
+    stats = run_buy_cycle()
+    typer.echo(stats)
+
+
 @app.command("schedule")
 def schedule() -> None:
     """Start the cron scheduler (blocking)."""

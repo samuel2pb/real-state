@@ -59,6 +59,19 @@ def _zap_unit_types() -> list[str]:
     return types or ["APARTMENT"]
 
 
+def _zap_buy_unit_types() -> list[str]:
+    """Resolve configured buy property types to Zap unitTypes values."""
+    raw = settings.buy_property_types.strip()
+    if not raw:
+        return ["APARTMENT"]
+    types = []
+    for t in raw.split(","):
+        mapped = _ZAP_PROPERTY_TYPE_MAP.get(t.strip())
+        if mapped:
+            types.append(mapped)
+    return types or ["APARTMENT"]
+
+
 class ZapSource(Source):
     name = "zap"
 
@@ -160,6 +173,43 @@ class ZapSource(Source):
             p.append(("amenities", amenities))
         return p
 
+    def _buy_params(
+        self, neighborhood: str, zone: str, page: int, size: int = 60
+    ) -> list[tuple[str, str]]:
+        p: list[tuple[str, str]] = [
+            ("user", ""),
+            ("portal", "ZAP"),
+            ("includeFields", INCLUDE),
+            ("business", "SALE"),
+            ("listingType", "USED"),
+            ("categoryPage", "RESULT"),
+            ("parentId", "null"),
+            ("addressCountry", "Brasil"),
+            ("addressState", settings.buy_state),
+            ("addressCity", settings.buy_city),
+            ("addressType", "neighborhood"),
+            ("addressLocationId", _location_id(neighborhood, zone)),
+            ("addressNeighborhood", neighborhood),
+            *[("unitTypes", ut) for ut in _zap_buy_unit_types()],
+            ("usageTypes", "RESIDENTIAL"),
+            ("priceMin", str(settings.buy_price_min)),
+            ("priceMax", str(settings.buy_price_max)),
+            ("bedroomsMin", str(settings.buy_bedrooms_min)),
+            ("bedroomsMax", str(settings.buy_bedrooms_max)),
+            ("bathrooms", str(settings.buy_bathrooms_min)),
+            ("suites", str(settings.buy_suites_min)),
+            ("parkingSpaces", str(settings.buy_parking_min)),
+            ("usableAreasMin", str(settings.buy_sqm_min)),
+            ("from", str((page - 1) * size)),
+            ("size", str(size)),
+            ("page", str(page)),
+            ("levels", "NEIGHBORHOOD"),
+            ("sort", "pricing.price.price ASC"),
+        ]
+        if settings.buy_pets_required:
+            p.append(("amenities", "PETS_ALLOWED"))
+        return p
+
     def _parse_one(
         self, raw: dict[str, Any], neighborhood_fallback: str
     ) -> Listing | None:
@@ -221,6 +271,68 @@ class ZapSource(Source):
             ),
         )
 
+    def _parse_buy_one(
+        self, raw: dict[str, Any], neighborhood_fallback: str
+    ) -> Listing | None:
+        node = raw.get("listing") or {}
+        ext_id = node.get("id") or raw.get("id") or ""
+        if not ext_id:
+            return None
+        pricings = node.get("pricingInfos") or []
+        sale_info = next(
+            (p for p in pricings if p.get("businessType") == "SALE"),
+            pricings[0] if pricings else {},
+        )
+        price_sale = float(sale_info.get("price") or 0)
+        condo_fee = float(sale_info.get("monthlyCondoFee") or 0)
+        iptu = float(
+            sale_info.get("yearlyIptu")
+            or sale_info.get("monthlyIptu")
+            or 0
+        )
+        addr = node.get("address") or {}
+        geo = (addr.get("geoLocation") or {}).get("location") or {}
+        link = raw.get("link") or {}
+        href = link.get("href") or ""
+        url = (
+            f"{BASE}{href}"
+            if href.startswith("/")
+            else href or f"{BASE}/imovel/{ext_id}/"
+        )
+        amenities = [a.upper() for a in (node.get("amenities") or [])]
+        pets = "PETS_ALLOWED" in amenities
+        furnished = "FURNISHED" in amenities
+        unit_types = node.get("unitTypes") or []
+        prop_type = unit_types[0] if unit_types else ""
+        return Listing(
+            source=self.name,
+            mode="buy",
+            external_id=str(ext_id),
+            url=url,
+            neighborhood=addr.get("neighborhood") or neighborhood_fallback,
+            price_rent=0.0,
+            price_total=price_sale,
+            price_sale=price_sale,
+            condo_fee=condo_fee,
+            iptu=iptu,
+            bedrooms=int((node.get("bedrooms") or [0])[0] or 0),
+            bathrooms=int((node.get("bathrooms") or [0])[0] or 0),
+            suites=int((node.get("suites") or [0])[0] or 0),
+            parking=int((node.get("parkingSpaces") or [0])[0] or 0),
+            sqm=float((node.get("usableAreas") or [0])[0] or 0),
+            pets=pets,
+            furnished=furnished,
+            property_type=prop_type,
+            lat=float(geo["lat"]) if geo.get("lat") else None,
+            lng=float(geo["lon"]) if geo.get("lon") else None,
+            address=", ".join(
+                filter(
+                    None,
+                    [addr.get("street"), addr.get("neighborhood"), addr.get("city")],
+                )
+            ),
+        )
+
     def search_rent(self, neighborhoods: list[str]) -> Iterator[Listing]:
         size = 60
         for nb in neighborhoods:
@@ -241,6 +353,34 @@ class ZapSource(Source):
                     break
                 for raw in hits:
                     lst = self._parse_one(raw, nb)
+                    if lst:
+                        yield lst
+                if len(hits) < size:
+                    break
+                page += 1
+                if page > 20:
+                    break
+
+    def search_buy(self, neighborhoods: list[str]) -> Iterator[Listing]:
+        size = 60
+        for nb in neighborhoods:
+            try:
+                zone = self._resolve_zone(nb)
+            except Exception as e:
+                log.warning("zap_buy_skip_nb", nb=nb, err=str(e))
+                continue
+            page = 1
+            while True:
+                r = self.http.get(GLUE_API, params=self._buy_params(nb, zone, page, size))
+                data = r.json()
+                hits = (
+                    ((data.get("search") or {}).get("result") or {}).get("listings")
+                ) or []
+                log.info("zap_buy_page", nb=nb, page=page, hits=len(hits))
+                if not hits:
+                    break
+                for raw in hits:
+                    lst = self._parse_buy_one(raw, nb)
                     if lst:
                         yield lst
                 if len(hits) < size:
