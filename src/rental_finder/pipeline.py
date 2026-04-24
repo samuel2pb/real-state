@@ -38,19 +38,19 @@ def _matches_buy_filters(lst: Listing) -> bool:
     s = settings
     if not (s.buy_price_min <= lst.price_sale <= s.buy_price_max):
         return False
-    if not (s.buy_bedrooms_min <= lst.bedrooms <= s.buy_bedrooms_max):
+    if not (s.rent_bedrooms_min <= lst.bedrooms <= s.rent_bedrooms_max):
         return False
-    if lst.bathrooms < s.buy_bathrooms_min:
+    if lst.bathrooms < s.rent_bathrooms_min:
         return False
-    if lst.suites < s.buy_suites_min:
+    if lst.suites < s.rent_suites_min:
         return False
-    if lst.sqm < s.buy_sqm_min:
+    if lst.sqm < s.rent_sqm_min:
         return False
-    if lst.parking < s.buy_parking_min:
+    if lst.parking < s.rent_parking_min:
         return False
-    if s.buy_pets_required and not lst.pets:
+    if s.rent_pets_required and not lst.pets:
         return False
-    if not s.buy_furnished_allowed and lst.furnished:
+    if not s.rent_furnished_allowed and lst.furnished:
         return False
     return True
 
