@@ -100,11 +100,20 @@ def main(kind: str = "rent") -> None:
     db = c.databases.create(
         parent={"type": "page_id", "page_id": settings.notion_parent_page_id},
         title=[{"type": "text", "text": {"content": TITLES[kind]}}],
-        properties=_schema(kind),
+        initial_data_source={"properties": _schema(kind)},
     )
+    ds_id = db["data_sources"][0]["id"] if db.get("data_sources") else None
+    props_created = False
+    if ds_id:
+        ds = c.data_sources.retrieve(data_source_id=ds_id)
+        props_created = len(ds.get("properties", {})) > 1
+        if not props_created:
+            c.data_sources.update(data_source_id=ds_id, properties=_schema(kind))
+            props_created = True
     typer.echo(f"Created {kind} DB: {db['id']}")
     typer.echo(f"URL: {db.get('url')}")
-    typer.echo(f"→ paste into .env as NOTION_{kind.upper()}_DB_ID")
+    typer.echo(f"Properties applied: {props_created}")
+    typer.echo(f"-> paste into .env as NOTION_{kind.upper()}_DB_ID")
     (ROOT / f".cache/notion_{kind}_db.json").parent.mkdir(parents=True, exist_ok=True)
     (ROOT / f".cache/notion_{kind}_db.json").write_text(
         json.dumps({"id": db["id"], "url": db.get("url")}, indent=2)
