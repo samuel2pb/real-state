@@ -212,10 +212,155 @@ class QuintoAndarSource(Source):
                         lst.property_type = hi["type"]
                 yield lst
 
+    def _buy_property_type_slugs(self) -> list[str]:
+        type_str = settings.buy_property_types.strip()
+        if not type_str:
+            return [""]  # no type filter
+        slugs = []
+        for t in type_str.split(","):
+            slug_t = _PROPERTY_TYPE_MAP.get(t.strip())
+            if slug_t:
+                slugs.append(slug_t)
+        return slugs or [""]
+
+    def _search_buy_url(self, neighborhood: str, type_slug: str = "") -> str:
+        slug = _slugify(neighborhood)
+        city_slug = _slugify(settings.buy_city)
+        state = settings.buy_state.lower()
+
+        segments = [f"comprar/imovel/{slug}-{city_slug}-{state}-brasil"]
+
+        if type_slug:
+            segments.append(type_slug)
+
+        segments.append(f"{settings.buy_bedrooms_min}-quartos")
+
+        parks = "-".join(
+            str(p)
+            for p in range(settings.buy_parking_min, settings.buy_parking_min + 3)
+        )
+        segments.append(f"{parks}-vagas")
+
+        baths = "-".join(
+            str(b)
+            for b in range(settings.buy_bathrooms_min, settings.buy_bathrooms_min + 3)
+        )
+        segments.append(f"{baths}-banheiros")
+
+        segments.append(f"de-{settings.buy_sqm_min}-a-1000-m2")
+
+        if not settings.buy_furnished_allowed:
+            segments.append("nao-mobiliado")
+
+        if settings.buy_suites_min > 0:
+            segments.append(f"{settings.buy_suites_min}-suites")
+
+        # Sale price uses '-venda' suffix on QuintoAndar buy URLs (not '-reais')
+        segments.append(
+            f"de-{settings.buy_price_min}-a-{settings.buy_price_max}-venda"
+        )
+
+        if settings.buy_condo_max > 0:
+            segments.append(f"de-0-a-{settings.buy_condo_max}-condo-iptu")
+
+        return BASE + "/" + "/".join(segments)
+
+    def _fetch_buy_search_houses(self, neighborhood: str) -> dict[str, dict]:
+        seen: dict[str, dict] = {}
+        for type_slug in self._buy_property_type_slugs():
+            url = self._search_buy_url(neighborhood, type_slug)
+            try:
+                r = self.http.get(url, headers={"Accept": "text/html"})
+            except Exception as e:
+                log.warning("qa_buy_ssr_err", nb=neighborhood, type=type_slug, err=str(e))
+                continue
+            nd = self._extract_next_data(r.text)
+            if not nd:
+                log.warning("qa_buy_no_nextdata", nb=neighborhood, url=url)
+                continue
+            houses = (
+                nd.get("props", {})
+                .get("pageProps", {})
+                .get("initialState", {})
+                .get("houses", {})
+            )
+            for hid, hdata in houses.items():
+                if hid.isdigit() and isinstance(hdata, dict) and hid not in seen:
+                    seen[hid] = hdata
+            total = (
+                nd.get("props", {})
+                .get("pageProps", {})
+                .get("initialState", {})
+                .get("search", {})
+                .get("visibleHouses", {})
+                .get("total", 0)
+            )
+            log.info(
+                "qa_buy_ssr", nb=neighborhood, type=type_slug, hits=len(houses), total=total
+            )
+        return seen
+
+    def _parse_buy_search_hit(
+        self, hid: str, raw: dict[str, Any], nb: str
+    ) -> Listing | None:
+        sale_price = float(raw.get("salePrice") or 0)
+        if sale_price <= 0:
+            return None
+        condo_iptu = float(raw.get("condoIptu") or raw.get("totalCost") or 0)
+        neighborhood = raw.get("neighbourhood") or raw.get("regionName") or nb
+        addr_raw = raw.get("address")
+        if isinstance(addr_raw, dict):
+            addr_str = addr_raw.get("address") or ""
+        else:
+            addr_str = str(addr_raw or "")
+        return Listing(
+            source=self.name,
+            mode="buy",
+            external_id=hid,
+            url=f"{BASE}/imovel/{hid}",
+            neighborhood=neighborhood,
+            price_rent=0.0,
+            price_total=sale_price,
+            price_sale=sale_price,
+            condo_fee=condo_iptu,
+            iptu=0.0,
+            bedrooms=int(raw.get("bedrooms") or 0),
+            bathrooms=int(raw.get("bathrooms") or 0),
+            suites=0,
+            parking=int(raw.get("parkingSpots") or 0),
+            sqm=float(raw.get("area") or 0),
+            pets=False,
+            furnished=bool(raw.get("isFurnished")),
+            property_type=str(raw.get("type") or ""),
+            lat=None,
+            lng=None,
+            address=f"{addr_str}, {neighborhood}" if addr_str else neighborhood,
+        )
+
     def search_buy(self, neighborhoods: list[str]) -> Iterator[Listing]:
-        # QuintoAndar buy not yet implemented; yields nothing.
-        return
-        yield  # noqa: unreachable — makes this a generator
+        for nb in neighborhoods:
+            houses = self._fetch_buy_search_houses(nb)
+            log.info("qa_buy_nb_done", nb=nb, unique_houses=len(houses))
+            for hid, hdata in houses.items():
+                lst = self._parse_buy_search_hit(hid, hdata, nb)
+                if not lst:
+                    continue
+                detail = self._fetch_detail(hid)
+                if detail:
+                    markers = detail.get("markers") or {}
+                    if markers.get("lat") and markers.get("lng"):
+                        lst.lat = float(markers["lat"])
+                        lst.lng = float(markers["lng"])
+                    hi = detail.get("houseInfo") or {}
+                    if hi.get("condoPrice"):
+                        lst.condo_fee = float(hi["condoPrice"])
+                    if hi.get("iptu"):
+                        lst.iptu = float(hi["iptu"])
+                    if hi.get("suites"):
+                        lst.suites = int(hi["suites"])
+                    if hi.get("type"):
+                        lst.property_type = hi["type"]
+                yield lst
 
     def check_alive(self, listing: Listing) -> bool:
         try:
