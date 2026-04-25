@@ -317,7 +317,7 @@ class QuintoAndarSource(Source):
             source=self.name,
             mode="buy",
             external_id=hid,
-            url=f"{BASE}/imovel/{hid}",
+            url=f"{BASE}/imovel/{hid}/comprar",
             neighborhood=neighborhood,
             price_rent=0.0,
             price_total=sale_price,
@@ -337,6 +337,26 @@ class QuintoAndarSource(Source):
             address=f"{addr_str}, {neighborhood}" if addr_str else neighborhood,
         )
 
+    def _fetch_buy_detail(self, house_id: str) -> dict[str, Any] | None:
+        # The bare /imovel/<id> URL 301-redirects to /imovel/<id>/alugar/<slug>
+        # which 404s for sale-only listings. /imovel/<id>/comprar resolves to
+        # the sale detail page via a 301 to its slugged form.
+        url = f"{BASE}/imovel/{house_id}/comprar"
+        try:
+            r = self.http.get(url, headers={"Accept": "text/html"})
+        except Exception as e:
+            log.warning("qa_buy_detail_err", id=house_id, err=str(e))
+            return None
+        nd = self._extract_next_data(r.text)
+        if not nd:
+            return None
+        return (
+            nd.get("props", {})
+            .get("pageProps", {})
+            .get("initialState", {})
+            .get("house", {})
+        )
+
     def search_buy(self, neighborhoods: list[str]) -> Iterator[Listing]:
         for nb in neighborhoods:
             houses = self._fetch_buy_search_houses(nb)
@@ -345,7 +365,7 @@ class QuintoAndarSource(Source):
                 lst = self._parse_buy_search_hit(hid, hdata, nb)
                 if not lst:
                     continue
-                detail = self._fetch_detail(hid)
+                detail = self._fetch_buy_detail(hid)
                 if detail:
                     markers = detail.get("markers") or {}
                     if markers.get("lat") and markers.get("lng"):
