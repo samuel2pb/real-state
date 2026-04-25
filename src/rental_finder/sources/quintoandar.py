@@ -380,6 +380,10 @@ class QuintoAndarSource(Source):
                         lst.suites = int(hi["suites"])
                     if hi.get("type"):
                         lst.property_type = hi["type"]
+                    if hi.get("acceptsPets") is not None:
+                        lst.pets = bool(hi["acceptsPets"])
+                    if hi.get("hasFurniture") is not None:
+                        lst.furnished = bool(hi["hasFurniture"])
                 yield lst
 
     def check_alive(self, listing: Listing) -> bool:

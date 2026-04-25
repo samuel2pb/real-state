@@ -37,22 +37,31 @@ def _matches_filters(lst: Listing) -> bool:
 def _matches_buy_filters(lst: Listing) -> bool:
     s = settings
     if not (s.buy_price_min <= lst.price_sale <= s.buy_price_max):
+        log.info("buy_reject", id=lst.global_id, why="price", v=lst.price_sale)
         return False
     if s.buy_condo_max > 0 and lst.condo_fee > s.buy_condo_max:
+        log.info("buy_reject", id=lst.global_id, why="condo", v=lst.condo_fee)
         return False
     if not (s.buy_bedrooms_min <= lst.bedrooms <= s.buy_bedrooms_max):
+        log.info("buy_reject", id=lst.global_id, why="bedrooms", v=lst.bedrooms)
         return False
     if lst.bathrooms < s.buy_bathrooms_min:
+        log.info("buy_reject", id=lst.global_id, why="bathrooms", v=lst.bathrooms)
         return False
     if lst.suites < s.buy_suites_min:
+        log.info("buy_reject", id=lst.global_id, why="suites", v=lst.suites)
         return False
     if lst.sqm < s.buy_sqm_min:
+        log.info("buy_reject", id=lst.global_id, why="sqm", v=lst.sqm)
         return False
     if lst.parking < s.buy_parking_min:
+        log.info("buy_reject", id=lst.global_id, why="parking", v=lst.parking)
         return False
     if s.buy_pets_required and not lst.pets:
+        log.info("buy_reject", id=lst.global_id, why="pets")
         return False
     if not s.buy_furnished_allowed and lst.furnished:
+        log.info("buy_reject", id=lst.global_id, why="furnished")
         return False
     return True
 
@@ -154,6 +163,12 @@ def run_buy_cycle() -> dict:
                     lst.distance_km is not None
                     and lst.distance_km > settings.work_max_distance_km
                 ):
+                    log.info(
+                        "buy_reject",
+                        id=lst.global_id,
+                        why="distance",
+                        v=lst.distance_km,
+                    )
                     continue
                 if not _matches_buy_filters(lst):
                     continue
