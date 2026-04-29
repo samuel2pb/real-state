@@ -80,6 +80,8 @@ def run_rent_cycle() -> dict:
     stats = {"fetched": 0, "kept": 0, "upserted": 0, "gone": 0, "per_source": {}}
 
     fetched_ids: dict[str, set[str]] = {s.name: set() for s in sources}
+    seen_ids: dict[str, set[str]] = {s.name: set() for s in sources}
+    completed: set[str] = set()
 
     for src in sources:
         sc = {"fetched": 0, "kept": 0, "upserted": 0}
@@ -87,6 +89,7 @@ def run_rent_cycle() -> dict:
             for lst in src.search_rent(settings.neighborhoods_list):
                 sc["fetched"] += 1
                 stats["fetched"] += 1
+                seen_ids[src.name].add(lst.external_id)
                 _annotate_distance(lst, work)
                 if (
                     lst.distance_km is not None
@@ -103,43 +106,23 @@ def run_rent_cycle() -> dict:
                 sc["upserted"] += 1
                 stats["kept"] += 1
                 stats["upserted"] += 1
+            completed.add(src.name)
         except Exception as e:
             log.error("source_error", source=src.name, err=str(e))
         stats["per_source"][src.name] = sc
         log.info("source_done", source=src.name, **sc)
 
-    src_by_name = {s.name: s for s in sources}
     for alive in store.list_alive():
         src_name = alive["source"]
-        if src_name not in src_by_name:
+        if src_name not in completed:
             continue
-        if alive["external_id"] in fetched_ids.get(src_name, set()):
-            continue
-        src = src_by_name[src_name]
-        ghost = Listing(
-            source=src_name,
-            external_id=alive["external_id"],
-            url=alive["url"],
-            neighborhood=alive["neighborhood"],
-            price_rent=0,
-            price_total=0,
-            bedrooms=0,
-            bathrooms=0,
-            suites=0,
-            parking=0,
-            sqm=0,
-            pets=False,
-            furnished=None,
-            lat=None,
-            lng=None,
-        )
-        if not src.check_alive(ghost):
-            store.mark_gone(alive["page_id"])
-            stats["gone"] += 1
-            log.info("marked_gone", id=f"{src_name}:{alive['external_id']}")
-        else:
+        if alive["external_id"] in seen_ids.get(src_name, set()):
             store.touch_alive(alive["page_id"])
             log.info("still_alive", id=f"{src_name}:{alive['external_id']}")
+            continue
+        store.mark_gone(alive["page_id"])
+        stats["gone"] += 1
+        log.info("marked_gone", id=f"{src_name}:{alive['external_id']}")
     return stats
 
 
@@ -151,6 +134,8 @@ def run_buy_cycle() -> dict:
     stats = {"fetched": 0, "kept": 0, "upserted": 0, "gone": 0, "per_source": {}}
 
     fetched_ids: dict[str, set[str]] = {s.name: set() for s in sources}
+    seen_ids: dict[str, set[str]] = {s.name: set() for s in sources}
+    completed: set[str] = set()
 
     for src in sources:
         sc = {"fetched": 0, "kept": 0, "upserted": 0}
@@ -158,6 +143,7 @@ def run_buy_cycle() -> dict:
             for lst in src.search_buy(settings.buy_neighborhoods_list):
                 sc["fetched"] += 1
                 stats["fetched"] += 1
+                seen_ids[src.name].add(lst.external_id)
                 _annotate_distance(lst, work)
                 if (
                     lst.distance_km is not None
@@ -180,43 +166,21 @@ def run_buy_cycle() -> dict:
                 sc["upserted"] += 1
                 stats["kept"] += 1
                 stats["upserted"] += 1
+            completed.add(src.name)
         except Exception as e:
             log.error("source_error", source=src.name, err=str(e))
         stats["per_source"][src.name] = sc
         log.info("source_done", source=src.name, **sc)
 
-    src_by_name = {s.name: s for s in sources}
     for alive in store.list_alive(kind="buy"):
         src_name = alive["source"]
-        if src_name not in src_by_name:
+        if src_name not in completed:
             continue
-        if alive["external_id"] in fetched_ids.get(src_name, set()):
-            continue
-        src = src_by_name[src_name]
-        ghost = Listing(
-            source=src_name,
-            mode="buy",
-            external_id=alive["external_id"],
-            url=alive["url"],
-            neighborhood=alive["neighborhood"],
-            price_rent=0,
-            price_total=0,
-            price_sale=0,
-            bedrooms=0,
-            bathrooms=0,
-            suites=0,
-            parking=0,
-            sqm=0,
-            pets=False,
-            furnished=None,
-            lat=None,
-            lng=None,
-        )
-        if not src.check_alive(ghost):
-            store.mark_gone(alive["page_id"])
-            stats["gone"] += 1
-            log.info("marked_gone", id=ghost.global_id)
-        else:
+        if alive["external_id"] in seen_ids.get(src_name, set()):
             store.touch_alive(alive["page_id"])
-            log.info("still_alive", id=ghost.global_id)
+            log.info("still_alive", id=f"{src_name}:{alive['external_id']}")
+            continue
+        store.mark_gone(alive["page_id"])
+        stats["gone"] += 1
+        log.info("marked_gone", id=f"{src_name}:{alive['external_id']}")
     return stats
