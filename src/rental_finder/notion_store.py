@@ -198,7 +198,6 @@ class NotionStore:
             page_id=page_id,
             properties={
                 "Status": {"select": {"name": "gone"}},
-                "LastSeen": {"date": {"start": date.today().isoformat()}},
             },
         )
 

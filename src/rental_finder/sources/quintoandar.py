@@ -43,7 +43,12 @@ class QuintoAndarSource(Source):
             },
         )
 
-    def _search_url(self, neighborhood: str) -> str:
+    def _search_url(
+        self,
+        neighborhood: str,
+        price_min: int | None = None,
+        price_max: int | None = None,
+    ) -> str:
         slug = _slugify(neighborhood)
         city_slug = _slugify(settings.rent_city)
         state = settings.rent_state.lower()
@@ -57,9 +62,9 @@ class QuintoAndarSource(Source):
                 if slug_t:
                     segments.append(slug_t)
 
-        segments.append(
-            f"de-{settings.rent_price_min}-a-{settings.rent_price_max}-reais"
-        )
+        pmin = price_min if price_min is not None else settings.rent_price_min
+        pmax = price_max if price_max is not None else settings.rent_price_max
+        segments.append(f"de-{pmin}-a-{pmax}-reais")
 
         beds = str(settings.rent_bedrooms_min)
         segments.append(f"{beds}-quartos")
@@ -98,19 +103,23 @@ class QuintoAndarSource(Source):
         except (json.JSONDecodeError, ValueError):
             return None
 
-    def _fetch_search_houses(self, neighborhood: str) -> dict[str, dict]:
-        """Fetch SSR search page and return {house_id: house_dict}."""
+    def _fetch_search_bucket(
+        self, neighborhood: str, price_min: int, price_max: int
+    ) -> tuple[dict[str, dict], int]:
+        """Fetch one price bucket. Returns (houses, total reported)."""
         seen: dict[str, dict] = {}
-        url = self._search_url(neighborhood)
+        url = self._search_url(neighborhood, price_min, price_max)
         try:
             r = self.http.get(url, headers={"Accept": "text/html"})
         except Exception as e:
-            log.warning("qa_ssr_err", nb=neighborhood, err=str(e))
-            return seen
+            log.warning(
+                "qa_ssr_err", nb=neighborhood, pmin=price_min, pmax=price_max, err=str(e)
+            )
+            return seen, 0
         nd = self._extract_next_data(r.text)
         if not nd:
             log.warning("qa_no_nextdata", nb=neighborhood, url=url)
-            return seen
+            return seen, 0
         houses = (
             nd.get("props", {})
             .get("pageProps", {})
@@ -131,9 +140,41 @@ class QuintoAndarSource(Source):
         log.info(
             "qa_ssr",
             nb=neighborhood,
+            pmin=price_min,
+            pmax=price_max,
             hits=len(seen),
             total=total,
         )
+        return seen, total
+
+    def _fetch_search_houses(self, neighborhood: str) -> dict[str, dict]:
+        """Fetch SSR search page across price-bisected buckets when truncated.
+
+        QA SSR caps results at 12 per page and ignores pagination params.
+        Bisect price range until each bucket reports total <= hits.
+        """
+        seen: dict[str, dict] = {}
+        stack: list[tuple[int, int]] = [
+            (settings.rent_price_min, settings.rent_price_max)
+        ]
+        while stack:
+            pmin, pmax = stack.pop()
+            houses, total = self._fetch_search_bucket(neighborhood, pmin, pmax)
+            for hid, hdata in houses.items():
+                seen.setdefault(hid, hdata)
+            if total > len(houses) and pmax - pmin > 1:
+                mid = (pmin + pmax) // 2
+                stack.append((pmin, mid))
+                stack.append((mid + 1, pmax))
+            elif total > len(houses):
+                log.warning(
+                    "qa_truncated",
+                    nb=neighborhood,
+                    pmin=pmin,
+                    pmax=pmax,
+                    hits=len(houses),
+                    total=total,
+                )
         return seen
 
     def _fetch_detail(self, house_id: str) -> dict[str, Any] | None:
@@ -223,7 +264,13 @@ class QuintoAndarSource(Source):
                 slugs.append(slug_t)
         return slugs or [""]
 
-    def _search_buy_url(self, neighborhood: str, type_slug: str = "") -> str:
+    def _search_buy_url(
+        self,
+        neighborhood: str,
+        type_slug: str = "",
+        price_min: int | None = None,
+        price_max: int | None = None,
+    ) -> str:
         slug = _slugify(neighborhood)
         city_slug = _slugify(settings.buy_city)
         state = settings.buy_state.lower()
@@ -255,49 +302,93 @@ class QuintoAndarSource(Source):
         if settings.buy_suites_min > 0:
             segments.append(f"{settings.buy_suites_min}-suites")
 
+        pmin = price_min if price_min is not None else settings.buy_price_min
+        pmax = price_max if price_max is not None else settings.buy_price_max
         # Sale price uses '-venda' suffix on QuintoAndar buy URLs (not '-reais')
-        segments.append(
-            f"de-{settings.buy_price_min}-a-{settings.buy_price_max}-venda"
-        )
+        segments.append(f"de-{pmin}-a-{pmax}-venda")
 
         if settings.buy_condo_max > 0:
             segments.append(f"de-0-a-{settings.buy_condo_max}-condo-iptu")
 
         return BASE + "/" + "/".join(segments)
 
+    def _fetch_buy_bucket(
+        self, neighborhood: str, type_slug: str, price_min: int, price_max: int
+    ) -> tuple[dict[str, dict], int]:
+        seen: dict[str, dict] = {}
+        url = self._search_buy_url(neighborhood, type_slug, price_min, price_max)
+        try:
+            r = self.http.get(url, headers={"Accept": "text/html"})
+        except Exception as e:
+            log.warning(
+                "qa_buy_ssr_err",
+                nb=neighborhood,
+                type=type_slug,
+                pmin=price_min,
+                pmax=price_max,
+                err=str(e),
+            )
+            return seen, 0
+        nd = self._extract_next_data(r.text)
+        if not nd:
+            log.warning("qa_buy_no_nextdata", nb=neighborhood, url=url)
+            return seen, 0
+        houses = (
+            nd.get("props", {})
+            .get("pageProps", {})
+            .get("initialState", {})
+            .get("houses", {})
+        )
+        for hid, hdata in houses.items():
+            if hid.isdigit() and isinstance(hdata, dict):
+                seen[hid] = hdata
+        total = (
+            nd.get("props", {})
+            .get("pageProps", {})
+            .get("initialState", {})
+            .get("search", {})
+            .get("visibleHouses", {})
+            .get("total", 0)
+        )
+        log.info(
+            "qa_buy_ssr",
+            nb=neighborhood,
+            type=type_slug,
+            pmin=price_min,
+            pmax=price_max,
+            hits=len(seen),
+            total=total,
+        )
+        return seen, total
+
     def _fetch_buy_search_houses(self, neighborhood: str) -> dict[str, dict]:
+        """Bisect price range when SSR truncates (cap ~12 per page)."""
         seen: dict[str, dict] = {}
         for type_slug in self._buy_property_type_slugs():
-            url = self._search_buy_url(neighborhood, type_slug)
-            try:
-                r = self.http.get(url, headers={"Accept": "text/html"})
-            except Exception as e:
-                log.warning("qa_buy_ssr_err", nb=neighborhood, type=type_slug, err=str(e))
-                continue
-            nd = self._extract_next_data(r.text)
-            if not nd:
-                log.warning("qa_buy_no_nextdata", nb=neighborhood, url=url)
-                continue
-            houses = (
-                nd.get("props", {})
-                .get("pageProps", {})
-                .get("initialState", {})
-                .get("houses", {})
-            )
-            for hid, hdata in houses.items():
-                if hid.isdigit() and isinstance(hdata, dict) and hid not in seen:
-                    seen[hid] = hdata
-            total = (
-                nd.get("props", {})
-                .get("pageProps", {})
-                .get("initialState", {})
-                .get("search", {})
-                .get("visibleHouses", {})
-                .get("total", 0)
-            )
-            log.info(
-                "qa_buy_ssr", nb=neighborhood, type=type_slug, hits=len(houses), total=total
-            )
+            stack: list[tuple[int, int]] = [
+                (settings.buy_price_min, settings.buy_price_max)
+            ]
+            while stack:
+                pmin, pmax = stack.pop()
+                houses, total = self._fetch_buy_bucket(
+                    neighborhood, type_slug, pmin, pmax
+                )
+                for hid, hdata in houses.items():
+                    seen.setdefault(hid, hdata)
+                if total > len(houses) and pmax - pmin > 1:
+                    mid = (pmin + pmax) // 2
+                    stack.append((pmin, mid))
+                    stack.append((mid + 1, pmax))
+                elif total > len(houses):
+                    log.warning(
+                        "qa_buy_truncated",
+                        nb=neighborhood,
+                        type=type_slug,
+                        pmin=pmin,
+                        pmax=pmax,
+                        hits=len(houses),
+                        total=total,
+                    )
         return seen
 
     def _parse_buy_search_hit(
