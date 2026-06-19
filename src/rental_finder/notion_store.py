@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 from datetime import date
 from typing import Iterator
@@ -35,6 +36,8 @@ class NotionStore:
         self.client = Client(auth=settings.notion_token)
         self._ds_cache: dict[str, str] = {}
         self._missing_props: set[str] = set()
+        self._schema_ensured: set[str] = set()
+        self._lock = threading.Lock()
 
     def _db_id(self, kind: str) -> str:
         if kind == "rent":
@@ -52,15 +55,35 @@ class NotionStore:
         raise NotImplementedError(f"db kind {kind!r} not implemented yet")
 
     def _data_source_id(self, kind: str) -> str:
-        if kind in self._ds_cache:
-            return self._ds_cache[kind]
+        with self._lock:
+            if kind in self._ds_cache:
+                return self._ds_cache[kind]
         db = _retry(self.client.databases.retrieve, database_id=self._db_id(kind))
         sources = db.get("data_sources") or []
         if not sources:
             raise RuntimeError(f"notion db for {kind!r} has no data_sources")
         ds_id = sources[0]["id"]
-        self._ds_cache[kind] = ds_id
+        with self._lock:
+            self._ds_cache[kind] = ds_id
         return ds_id
+
+    def ensure_columns(self, kind: str = "rent") -> None:
+        """Idempotently ensure analytics columns exist on the data source schema."""
+        ds_id = self._data_source_id(kind)
+        with self._lock:
+            if ds_id in self._schema_ensured:
+                return
+        ds = _retry(self.client.data_sources.retrieve, data_source_id=ds_id)
+        existing = ds.get("properties") or {}
+        if "PriceUp" not in existing:
+            _retry(
+                self.client.data_sources.update,
+                data_source_id=ds_id,
+                properties={"PriceUp": {"number": {"format": "real"}}},
+            )
+            log.info("notion_col_added", kind=kind, col="PriceUp")
+        with self._lock:
+            self._schema_ensured.add(ds_id)
 
     def _find(self, kind: str, external_id: str, source: str) -> str | None:
         ds_id = self._data_source_id(kind)
@@ -96,6 +119,7 @@ class NotionStore:
                 if lst.neighborhood
                 else {"select": None},
                 "Price": {"number": lst.price_sale},
+                "PriceUp": {"number": None},
                 "CondoFee": {"number": lst.condo_fee},
                 "Iptu": {"number": lst.iptu},
                 "Bedrooms": {"number": lst.bedrooms},
@@ -128,6 +152,7 @@ class NotionStore:
             else {"select": None},
             "PriceRent": {"number": lst.price_rent},
             "PriceTotal": {"number": lst.price_total},
+            "PriceUp": {"number": None},
             "Bedrooms": {"number": lst.bedrooms},
             "Bathrooms": {"number": lst.bathrooms},
             "Suites": {"number": lst.suites},
@@ -147,8 +172,10 @@ class NotionStore:
         return props
 
     def _strip_missing(self, props: dict) -> dict:
-        if self._missing_props:
-            return {k: v for k, v in props.items() if k not in self._missing_props}
+        with self._lock:
+            missing = set(self._missing_props)
+        if missing:
+            return {k: v for k, v in props.items() if k not in missing}
         return props
 
     def upsert_listing(self, lst: Listing, kind: str = "rent") -> str:
@@ -161,7 +188,8 @@ class NotionStore:
             except APIResponseError as e:
                 prop = _extract_missing_prop(e)
                 if prop:
-                    self._missing_props.add(prop)
+                    with self._lock:
+                        self._missing_props.add(prop)
                     log.warning("notion_prop_missing", prop=prop)
                     props = self._strip_missing(props)
                     _retry(self.client.pages.update, page_id=page_id, properties=props)
@@ -210,13 +238,33 @@ class NotionStore:
             },
         )
 
-    def list_alive(self, kind: str = "rent") -> Iterator[dict]:
+    def mark_price_up(self, page_id: str, kind: str = "rent", price: float | None = None) -> None:
+        props: dict = {
+            "Status": {"select": {"name": "price-up"}},
+            "LastSeen": {"date": {"start": date.today().isoformat()}},
+        }
+        if price is not None:
+            props["PriceUp"] = {"number": price}
+        _retry(self.client.pages.update, page_id=page_id, properties=props)
+
+    def _list_by_status(self, kind: str, statuses: list[str]) -> Iterator[dict]:
         ds_id = self._data_source_id(kind)
+        if len(statuses) == 1:
+            status_filter: dict = {
+                "property": "Status",
+                "select": {"equals": statuses[0]},
+            }
+        else:
+            status_filter = {
+                "or": [
+                    {"property": "Status", "select": {"equals": s}} for s in statuses
+                ]
+            }
         cursor: str | None = None
         while True:
             kw: dict = {
                 "data_source_id": ds_id,
-                "filter": {"property": "Status", "select": {"equals": "available"}},
+                "filter": status_filter,
                 "page_size": 100,
             }
             if cursor:
@@ -236,6 +284,12 @@ class NotionStore:
             if not r.get("has_more"):
                 break
             cursor = r.get("next_cursor")
+
+    def list_alive(self, kind: str = "rent") -> Iterator[dict]:
+        yield from self._list_by_status(kind, ["available", "price-up"])
+
+    def list_gone(self, kind: str = "rent") -> Iterator[dict]:
+        yield from self._list_by_status(kind, ["gone"])
 
 
 def _plain(rt_prop: dict | None) -> str:

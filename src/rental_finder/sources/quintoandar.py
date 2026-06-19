@@ -230,28 +230,30 @@ class QuintoAndarSource(Source):
             log.info("qa_nb_done", nb=nb, unique_houses=len(houses))
             for hid, hdata in houses.items():
                 lst = self._parse_search_hit(hid, hdata, nb)
-                if not lst:
-                    continue
-                detail = self._fetch_detail(hid)
-                if detail:
-                    markers = detail.get("markers") or {}
-                    if markers.get("lat") and markers.get("lng"):
-                        lst.lat = float(markers["lat"])
-                        lst.lng = float(markers["lng"])
-                    hi = detail.get("houseInfo") or {}
-                    if hi.get("condoPrice"):
-                        condo = float(hi["condoPrice"])
-                        iptu = float(hi.get("iptu") or 0)
-                        lst.price_total = lst.price_rent + condo + iptu
-                    if hi.get("suites"):
-                        lst.suites = int(hi["suites"])
-                    if hi.get("acceptsPets") is not None:
-                        lst.pets = bool(hi["acceptsPets"])
-                    if hi.get("hasFurniture") is not None:
-                        lst.furnished = bool(hi["hasFurniture"])
-                    if hi.get("type"):
-                        lst.property_type = hi["type"]
-                yield lst
+                if lst:
+                    yield lst
+
+    def _enrich_rent(self, lst: Listing) -> None:
+        detail = self._fetch_detail(lst.external_id)
+        if not detail:
+            return
+        markers = detail.get("markers") or {}
+        if markers.get("lat") and markers.get("lng"):
+            lst.lat = float(markers["lat"])
+            lst.lng = float(markers["lng"])
+        hi = detail.get("houseInfo") or {}
+        if hi.get("condoPrice"):
+            condo = float(hi["condoPrice"])
+            iptu = float(hi.get("iptu") or 0)
+            lst.price_total = lst.price_rent + condo + iptu
+        if hi.get("suites"):
+            lst.suites = int(hi["suites"])
+        if hi.get("acceptsPets") is not None:
+            lst.pets = bool(hi["acceptsPets"])
+        if hi.get("hasFurniture") is not None:
+            lst.furnished = bool(hi["hasFurniture"])
+        if hi.get("type"):
+            lst.property_type = hi["type"]
 
     def _buy_property_type_slugs(self) -> list[str]:
         type_str = settings.buy_property_types.strip()
@@ -454,28 +456,66 @@ class QuintoAndarSource(Source):
             log.info("qa_buy_nb_done", nb=nb, unique_houses=len(houses))
             for hid, hdata in houses.items():
                 lst = self._parse_buy_search_hit(hid, hdata, nb)
-                if not lst:
-                    continue
-                detail = self._fetch_buy_detail(hid)
-                if detail:
-                    markers = detail.get("markers") or {}
-                    if markers.get("lat") and markers.get("lng"):
-                        lst.lat = float(markers["lat"])
-                        lst.lng = float(markers["lng"])
-                    hi = detail.get("houseInfo") or {}
-                    if hi.get("condoPrice"):
-                        lst.condo_fee = float(hi["condoPrice"])
-                    if hi.get("iptu"):
-                        lst.iptu = float(hi["iptu"])
-                    if hi.get("suites"):
-                        lst.suites = int(hi["suites"])
-                    if hi.get("type"):
-                        lst.property_type = hi["type"]
-                    if hi.get("acceptsPets") is not None:
-                        lst.pets = bool(hi["acceptsPets"])
-                    if hi.get("hasFurniture") is not None:
-                        lst.furnished = bool(hi["hasFurniture"])
-                yield lst
+                if lst:
+                    yield lst
+
+    def _enrich_buy(self, lst: Listing) -> None:
+        detail = self._fetch_buy_detail(lst.external_id)
+        if not detail:
+            return
+        markers = detail.get("markers") or {}
+        if markers.get("lat") and markers.get("lng"):
+            lst.lat = float(markers["lat"])
+            lst.lng = float(markers["lng"])
+        hi = detail.get("houseInfo") or {}
+        if hi.get("condoPrice"):
+            lst.condo_fee = float(hi["condoPrice"])
+        if hi.get("iptu"):
+            lst.iptu = float(hi["iptu"])
+        if hi.get("suites"):
+            lst.suites = int(hi["suites"])
+        if hi.get("type"):
+            lst.property_type = hi["type"]
+        if hi.get("acceptsPets") is not None:
+            lst.pets = bool(hi["acceptsPets"])
+        if hi.get("hasFurniture") is not None:
+            lst.furnished = bool(hi["hasFurniture"])
+
+    def enrich(self, lst: Listing) -> None:
+        if lst.mode == "buy":
+            self._enrich_buy(lst)
+        else:
+            self._enrich_rent(lst)
+
+    def recheck(self, *, external_id: str, url: str, kind: str) -> tuple[bool, float | None]:
+        """Re-fetch a single listing to distinguish truly-gone vs price-up."""
+        detail = (
+            self._fetch_buy_detail(external_id)
+            if kind == "buy"
+            else self._fetch_detail(external_id)
+        )
+        if not detail:
+            return (False, None)
+        if kind == "buy":
+            # detail is the top-level house state dict; salePrice lives at the top
+            # level (same key as in buy search hits: raw.get("salePrice")).
+            # Fall back to houseInfo.salePrice if absent.
+            hi = detail.get("houseInfo") or {}
+            raw_price = detail.get("salePrice") or hi.get("salePrice") or 0
+            price: float | None = float(raw_price) if raw_price else None
+        else:
+            # rent: totalCost (rent+condo+iptu) with fallback to rentPrice,
+            # mirroring _parse_search_hit. Also check houseInfo for enriched total.
+            hi = detail.get("houseInfo") or {}
+            raw_price = (
+                detail.get("totalCost")
+                or detail.get("rentPrice")
+                or hi.get("totalCost")
+                or hi.get("rentPrice")
+                or 0
+            )
+            price = float(raw_price) if raw_price else None
+        return (True, price)
 
     def check_alive(self, listing: Listing) -> bool:
         try:

@@ -80,6 +80,7 @@ def _schema(kind: str = "rent") -> dict:
         "Address": {"rich_text": {}},
         "FirstSeen": {"date": {}},
         "LastSeen": {"date": {}},
+        "PriceUp": {"number": {"format": "real"}},
     }
     if kind == "buy":
         shared["Price"] = {"number": {"format": "real"}}

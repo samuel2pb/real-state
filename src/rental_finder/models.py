@@ -26,7 +26,7 @@ class Listing:
     distance_km: float | None = None
     first_seen: date = field(default_factory=date.today)
     last_seen: date = field(default_factory=date.today)
-    status: str = "available"  # "available" | "gone"
+    status: str = "available"  # "available" | "gone" | "price-up"
     mode: str = "rent"          # "rent" | "buy"
     price_sale: float = 0.0     # sale price (zero for rent listings)
     condo_fee: float = 0.0      # monthly condo (display only)

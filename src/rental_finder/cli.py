@@ -6,7 +6,7 @@ import structlog
 import typer
 
 from .config import settings
-from .pipeline import run_rent_cycle
+from .pipeline import run_rent_cycle, recheck_gone
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
 
@@ -38,6 +38,20 @@ def run_buy_once() -> None:
     from .pipeline import run_buy_cycle
     stats = run_buy_cycle()
     typer.echo(stats)
+
+
+@app.command("recheck-gone")
+def recheck_gone_cmd(
+    kind: str = typer.Option("both", help="'rent', 'buy', or 'both'"),
+) -> None:
+    """Re-examine gone listings; promote price-up ones. Occasional backfill only."""
+    _init_logging()
+    if kind in ("rent", "both"):
+        stats = recheck_gone(kind="rent")
+        typer.echo({"kind": "rent", **stats})
+    if kind in ("buy", "both"):
+        stats = recheck_gone(kind="buy")
+        typer.echo({"kind": "buy", **stats})
 
 
 @app.command("schedule")

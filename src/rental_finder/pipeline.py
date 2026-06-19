@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 
 import structlog
@@ -9,8 +11,11 @@ from .geo import distance_km, work_coords
 from .models import Listing
 from .notion_store import NotionStore
 from .sources import enabled_sources
+from .sources.base import Source
 
 log = structlog.get_logger(__name__)
+
+POOL_WORKERS = 10
 
 
 def _matches_filters(lst: Listing) -> bool:
@@ -72,47 +77,97 @@ def _annotate_distance(lst: Listing, work: tuple[float, float]) -> None:
     lst.distance_km = round(distance_km(work, (lst.lat, lst.lng)), 3)
 
 
+def _process_listing(
+    lst: Listing,
+    src: Source,
+    store: NotionStore,
+    work: tuple[float, float],
+    today: date,
+    matches: callable,
+    kind: str,
+) -> bool:
+    """Enrich + filter + upsert one listing. Returns True if upserted."""
+    src.enrich(lst)
+    _annotate_distance(lst, work)
+    if (
+        lst.distance_km is not None
+        and lst.distance_km > settings.work_max_distance_km
+    ):
+        if kind == "buy":
+            log.info("buy_reject", id=lst.global_id, why="distance", v=lst.distance_km)
+        return False
+    if not matches(lst):
+        return False
+    lst.last_seen = today
+    lst.first_seen = today
+    store.upsert_listing(lst, kind=kind)
+    return True
+
+
+def _run_source(
+    src: Source,
+    store: NotionStore,
+    work: tuple[float, float],
+    today: date,
+    kind: str,
+) -> tuple[dict, set[str]]:
+    sc = {"fetched": 0, "kept": 0, "upserted": 0}
+    seen: set[str] = set()
+    seen_lock = threading.Lock()
+    matches = _matches_buy_filters if kind == "buy" else _matches_filters
+    search_iter = (
+        src.search_buy(settings.buy_neighborhoods_list)
+        if kind == "buy"
+        else src.search_rent(settings.neighborhoods_list)
+    )
+
+    def _job(lst: Listing) -> bool:
+        with seen_lock:
+            seen.add(lst.external_id)
+        return _process_listing(lst, src, store, work, today, matches, kind)
+
+    with ThreadPoolExecutor(max_workers=POOL_WORKERS) as pool:
+        futures = []
+        for lst in search_iter:
+            sc["fetched"] += 1
+            futures.append(pool.submit(_job, lst))
+        for fut in as_completed(futures):
+            try:
+                if fut.result():
+                    sc["kept"] += 1
+                    sc["upserted"] += 1
+            except Exception as e:
+                log.error("listing_error", source=src.name, err=str(e))
+    return sc, seen
+
+
 def run_rent_cycle() -> dict:
     work = work_coords()
     store = NotionStore()
+    store.ensure_columns("rent")
     sources = enabled_sources()
     today = date.today()
-    stats = {"fetched": 0, "kept": 0, "upserted": 0, "gone": 0, "per_source": {}}
+    stats = {"fetched": 0, "kept": 0, "upserted": 0, "gone": 0, "price_up": 0, "per_source": {}}
 
-    fetched_ids: dict[str, set[str]] = {s.name: set() for s in sources}
     seen_ids: dict[str, set[str]] = {s.name: set() for s in sources}
     completed: set[str] = set()
 
     for src in sources:
-        sc = {"fetched": 0, "kept": 0, "upserted": 0}
         try:
-            for lst in src.search_rent(settings.neighborhoods_list):
-                sc["fetched"] += 1
-                stats["fetched"] += 1
-                seen_ids[src.name].add(lst.external_id)
-                _annotate_distance(lst, work)
-                if (
-                    lst.distance_km is not None
-                    and lst.distance_km > settings.work_max_distance_km
-                ):
-                    continue
-                if not _matches_filters(lst):
-                    continue
-                lst.last_seen = today
-                lst.first_seen = today
-                store.upsert_listing(lst)
-                fetched_ids[src.name].add(lst.external_id)
-                sc["kept"] += 1
-                sc["upserted"] += 1
-                stats["kept"] += 1
-                stats["upserted"] += 1
+            sc, seen = _run_source(src, store, work, today, kind="rent")
+            seen_ids[src.name] = seen
+            stats["fetched"] += sc["fetched"]
+            stats["kept"] += sc["kept"]
+            stats["upserted"] += sc["upserted"]
             completed.add(src.name)
         except Exception as e:
+            sc = {"fetched": 0, "kept": 0, "upserted": 0}
             log.error("source_error", source=src.name, err=str(e))
         stats["per_source"][src.name] = sc
         log.info("source_done", source=src.name, **sc)
 
-    for alive in store.list_alive():
+    src_by_name = {s.name: s for s in sources}
+    for alive in store.list_alive(kind="rent"):
         src_name = alive["source"]
         if src_name not in completed:
             continue
@@ -120,58 +175,49 @@ def run_rent_cycle() -> dict:
             store.touch_alive(alive["page_id"])
             log.info("still_alive", id=f"{src_name}:{alive['external_id']}")
             continue
-        store.mark_gone(alive["page_id"])
-        stats["gone"] += 1
-        log.info("marked_gone", id=f"{src_name}:{alive['external_id']}")
+        src = src_by_name.get(src_name)
+        alive_flag, price = (False, None)
+        if src is not None:
+            alive_flag, price = src.recheck(
+                external_id=alive["external_id"], url=alive["url"], kind="rent"
+            )
+        if alive_flag and price is not None and price > settings.rent_price_max:
+            store.mark_price_up(alive["page_id"], kind="rent", price=price)
+            stats["price_up"] += 1
+            log.info("marked_price_up", id=f"{src_name}:{alive['external_id']}", price=price)
+        else:
+            store.mark_gone(alive["page_id"])
+            stats["gone"] += 1
+            log.info("marked_gone", id=f"{src_name}:{alive['external_id']}")
     return stats
 
 
 def run_buy_cycle() -> dict:
     work = work_coords()
     store = NotionStore()
+    store.ensure_columns("buy")
     sources = enabled_sources(mode="buy")
     today = date.today()
-    stats = {"fetched": 0, "kept": 0, "upserted": 0, "gone": 0, "per_source": {}}
+    stats = {"fetched": 0, "kept": 0, "upserted": 0, "gone": 0, "price_up": 0, "per_source": {}}
 
-    fetched_ids: dict[str, set[str]] = {s.name: set() for s in sources}
     seen_ids: dict[str, set[str]] = {s.name: set() for s in sources}
     completed: set[str] = set()
 
     for src in sources:
-        sc = {"fetched": 0, "kept": 0, "upserted": 0}
         try:
-            for lst in src.search_buy(settings.buy_neighborhoods_list):
-                sc["fetched"] += 1
-                stats["fetched"] += 1
-                seen_ids[src.name].add(lst.external_id)
-                _annotate_distance(lst, work)
-                if (
-                    lst.distance_km is not None
-                    and lst.distance_km > settings.work_max_distance_km
-                ):
-                    log.info(
-                        "buy_reject",
-                        id=lst.global_id,
-                        why="distance",
-                        v=lst.distance_km,
-                    )
-                    continue
-                if not _matches_buy_filters(lst):
-                    continue
-                lst.last_seen = today
-                lst.first_seen = today
-                store.upsert_listing(lst, kind="buy")
-                fetched_ids[src.name].add(lst.external_id)
-                sc["kept"] += 1
-                sc["upserted"] += 1
-                stats["kept"] += 1
-                stats["upserted"] += 1
+            sc, seen = _run_source(src, store, work, today, kind="buy")
+            seen_ids[src.name] = seen
+            stats["fetched"] += sc["fetched"]
+            stats["kept"] += sc["kept"]
+            stats["upserted"] += sc["upserted"]
             completed.add(src.name)
         except Exception as e:
+            sc = {"fetched": 0, "kept": 0, "upserted": 0}
             log.error("source_error", source=src.name, err=str(e))
         stats["per_source"][src.name] = sc
         log.info("source_done", source=src.name, **sc)
 
+    src_by_name = {s.name: s for s in sources}
     for alive in store.list_alive(kind="buy"):
         src_name = alive["source"]
         if src_name not in completed:
@@ -180,7 +226,51 @@ def run_buy_cycle() -> dict:
             store.touch_alive(alive["page_id"])
             log.info("still_alive", id=f"{src_name}:{alive['external_id']}")
             continue
-        store.mark_gone(alive["page_id"])
-        stats["gone"] += 1
-        log.info("marked_gone", id=f"{src_name}:{alive['external_id']}")
+        src = src_by_name.get(src_name)
+        alive_flag, price = (False, None)
+        if src is not None:
+            alive_flag, price = src.recheck(
+                external_id=alive["external_id"], url=alive["url"], kind="buy"
+            )
+        if alive_flag and price is not None and price > settings.buy_price_max:
+            store.mark_price_up(alive["page_id"], kind="buy", price=price)
+            stats["price_up"] += 1
+            log.info("marked_price_up", id=f"{src_name}:{alive['external_id']}", price=price)
+        else:
+            store.mark_gone(alive["page_id"])
+            stats["gone"] += 1
+            log.info("marked_gone", id=f"{src_name}:{alive['external_id']}")
+    return stats
+
+
+def recheck_gone(kind: str = "rent") -> dict:
+    """Re-examine listings already marked gone; promote true price-up ones.
+
+    Live + current price > max -> mark_price_up. Else leave gone.
+    Intended as an occasional backfill, NOT called automatically from run cycles.
+    """
+    store = NotionStore()
+    store.ensure_columns(kind)
+    sources = enabled_sources(mode=kind)
+    src_by_name = {s.name: s for s in sources}
+    pmax = settings.buy_price_max if kind == "buy" else settings.rent_price_max
+    stats = {"examined": 0, "price_up": 0, "skipped": 0}
+
+    for gone in store.list_gone(kind=kind):
+        stats["examined"] += 1
+        src_name = gone["source"]
+        src = src_by_name.get(src_name)
+        if src is None:
+            stats["skipped"] += 1
+            continue
+        alive_flag, price = src.recheck(
+            external_id=gone["external_id"], url=gone["url"], kind=kind
+        )
+        if alive_flag and price is not None and price > pmax:
+            store.mark_price_up(gone["page_id"], kind=kind, price=price)
+            stats["price_up"] += 1
+            log.info("recheck_priceup", id=f"{src_name}:{gone['external_id']}", price=price)
+        else:
+            stats["skipped"] += 1
+
     return stats
