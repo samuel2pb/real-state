@@ -115,23 +115,29 @@ def _run_source(
     seen: set[str] = set()
     seen_lock = threading.Lock()
     matches = _matches_buy_filters if kind == "buy" else _matches_filters
-    search_iter = (
-        src.search_buy(settings.buy_neighborhoods_list)
-        if kind == "buy"
-        else src.search_rent(settings.neighborhoods_list)
+    neighborhoods = (
+        settings.buy_neighborhoods_list if kind == "buy" else settings.neighborhoods_list
     )
+    tasks = src.search_tasks(neighborhoods, kind)
 
     def _job(lst: Listing) -> bool:
-        with seen_lock:
-            seen.add(lst.external_id)
         return _process_listing(lst, src, store, work, today, matches, kind)
 
     with ThreadPoolExecutor(max_workers=POOL_WORKERS) as pool:
-        futures = []
-        for lst in search_iter:
-            sc["fetched"] += 1
-            futures.append(pool.submit(_job, lst))
-        for fut in as_completed(futures):
+        search_futures = [pool.submit(task) for task in tasks]
+        enrich_futures = []
+        for fut in as_completed(search_futures):
+            try:
+                listings = fut.result()
+            except Exception as e:
+                log.error("search_task_error", source=src.name, err=str(e))
+                continue
+            for lst in listings:
+                sc["fetched"] += 1
+                with seen_lock:
+                    seen.add(lst.external_id)
+                enrich_futures.append(pool.submit(_job, lst))
+        for fut in as_completed(enrich_futures):
             try:
                 if fut.result():
                     sc["kept"] += 1
@@ -139,6 +145,51 @@ def _run_source(
             except Exception as e:
                 log.error("listing_error", source=src.name, err=str(e))
     return sc, seen
+
+
+def _reconcile_alive(
+    store: NotionStore,
+    src_by_name: dict[str, Source],
+    seen_ids: dict[str, set[str]],
+    completed: set[str],
+    kind: str,
+    stats: dict,
+) -> None:
+    pmax = settings.buy_price_max if kind == "buy" else settings.rent_price_max
+    stats_lock = threading.Lock()
+
+    def _job(alive: dict) -> None:
+        src_name = alive["source"]
+        if src_name not in completed:
+            return
+        if alive["external_id"] in seen_ids.get(src_name, set()):
+            store.touch_alive(alive["page_id"])
+            log.info("still_alive", id=f"{src_name}:{alive['external_id']}")
+            return
+        src = src_by_name.get(src_name)
+        alive_flag, price = (False, None)
+        if src is not None:
+            alive_flag, price = src.recheck(
+                external_id=alive["external_id"], url=alive["url"], kind=kind
+            )
+        if alive_flag and price is not None and price > pmax:
+            store.mark_price_up(alive["page_id"], kind=kind, price=price)
+            with stats_lock:
+                stats["price_up"] += 1
+            log.info("marked_price_up", id=f"{src_name}:{alive['external_id']}", price=price)
+        else:
+            store.mark_gone(alive["page_id"])
+            with stats_lock:
+                stats["gone"] += 1
+            log.info("marked_gone", id=f"{src_name}:{alive['external_id']}")
+
+    with ThreadPoolExecutor(max_workers=POOL_WORKERS) as pool:
+        futures = [pool.submit(_job, alive) for alive in store.list_alive(kind=kind)]
+        for fut in as_completed(futures):
+            try:
+                fut.result()
+            except Exception as e:
+                log.error("reconcile_error", kind=kind, err=str(e))
 
 
 def run_rent_cycle() -> dict:
@@ -167,28 +218,7 @@ def run_rent_cycle() -> dict:
         log.info("source_done", source=src.name, **sc)
 
     src_by_name = {s.name: s for s in sources}
-    for alive in store.list_alive(kind="rent"):
-        src_name = alive["source"]
-        if src_name not in completed:
-            continue
-        if alive["external_id"] in seen_ids.get(src_name, set()):
-            store.touch_alive(alive["page_id"])
-            log.info("still_alive", id=f"{src_name}:{alive['external_id']}")
-            continue
-        src = src_by_name.get(src_name)
-        alive_flag, price = (False, None)
-        if src is not None:
-            alive_flag, price = src.recheck(
-                external_id=alive["external_id"], url=alive["url"], kind="rent"
-            )
-        if alive_flag and price is not None and price > settings.rent_price_max:
-            store.mark_price_up(alive["page_id"], kind="rent", price=price)
-            stats["price_up"] += 1
-            log.info("marked_price_up", id=f"{src_name}:{alive['external_id']}", price=price)
-        else:
-            store.mark_gone(alive["page_id"])
-            stats["gone"] += 1
-            log.info("marked_gone", id=f"{src_name}:{alive['external_id']}")
+    _reconcile_alive(store, src_by_name, seen_ids, completed, "rent", stats)
     return stats
 
 
@@ -218,28 +248,7 @@ def run_buy_cycle() -> dict:
         log.info("source_done", source=src.name, **sc)
 
     src_by_name = {s.name: s for s in sources}
-    for alive in store.list_alive(kind="buy"):
-        src_name = alive["source"]
-        if src_name not in completed:
-            continue
-        if alive["external_id"] in seen_ids.get(src_name, set()):
-            store.touch_alive(alive["page_id"])
-            log.info("still_alive", id=f"{src_name}:{alive['external_id']}")
-            continue
-        src = src_by_name.get(src_name)
-        alive_flag, price = (False, None)
-        if src is not None:
-            alive_flag, price = src.recheck(
-                external_id=alive["external_id"], url=alive["url"], kind="buy"
-            )
-        if alive_flag and price is not None and price > settings.buy_price_max:
-            store.mark_price_up(alive["page_id"], kind="buy", price=price)
-            stats["price_up"] += 1
-            log.info("marked_price_up", id=f"{src_name}:{alive['external_id']}", price=price)
-        else:
-            store.mark_gone(alive["page_id"])
-            stats["gone"] += 1
-            log.info("marked_gone", id=f"{src_name}:{alive['external_id']}")
+    _reconcile_alive(store, src_by_name, seen_ids, completed, "buy", stats)
     return stats
 
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Iterator
+from typing import Callable, Iterator
 
 from ..models import Listing
 
@@ -21,6 +21,22 @@ class Source(ABC):
     def enrich(self, lst: Listing) -> None:
         """Mutate listing with per-detail data (e.g. lat/lng, condo). Default no-op."""
         return None
+
+    def search_tasks(
+        self, neighborhoods: list[str], kind: str
+    ) -> list[Callable[[], list[Listing]]]:
+        """Build independent, thread-safe fetch units for parallel search fan-out.
+
+        Each callable fetches one unit of work and returns its listings.
+        Default: one task per neighborhood, delegating to search_buy/search_rent.
+        """
+
+        def _task(nb: str) -> list[Listing]:
+            if kind == "buy":
+                return list(self.search_buy([nb]))
+            return list(self.search_rent([nb]))
+
+        return [(lambda nb=nb: _task(nb)) for nb in neighborhoods]
 
     def recheck(self, *, external_id: str, url: str, kind: str) -> tuple[bool, float | None]:
         """Re-fetch a single listing that's missing from search results.

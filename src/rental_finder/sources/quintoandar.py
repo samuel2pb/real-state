@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 import structlog
 
@@ -224,14 +224,19 @@ class QuintoAndarSource(Source):
             address=f"{addr}, {neighborhood}" if addr else neighborhood,
         )
 
+    def _fetch_rent_nb_listings(self, nb: str) -> list[Listing]:
+        houses = self._fetch_search_houses(nb)
+        log.info("qa_nb_done", nb=nb, unique_houses=len(houses))
+        out: list[Listing] = []
+        for hid, hdata in houses.items():
+            lst = self._parse_search_hit(hid, hdata, nb)
+            if lst:
+                out.append(lst)
+        return out
+
     def search_rent(self, neighborhoods: list[str]) -> Iterator[Listing]:
         for nb in neighborhoods:
-            houses = self._fetch_search_houses(nb)
-            log.info("qa_nb_done", nb=nb, unique_houses=len(houses))
-            for hid, hdata in houses.items():
-                lst = self._parse_search_hit(hid, hdata, nb)
-                if lst:
-                    yield lst
+            yield from self._fetch_rent_nb_listings(nb)
 
     def _enrich_rent(self, lst: Listing) -> None:
         detail = self._fetch_detail(lst.external_id)
@@ -363,35 +368,55 @@ class QuintoAndarSource(Source):
         )
         return seen, total
 
+    def _fetch_buy_type_houses(
+        self, neighborhood: str, type_slug: str
+    ) -> dict[str, dict]:
+        """Bisect price range for one (neighborhood, type_slug) bucket."""
+        seen: dict[str, dict] = {}
+        stack: list[tuple[int, int]] = [
+            (settings.buy_price_min, settings.buy_price_max)
+        ]
+        while stack:
+            pmin, pmax = stack.pop()
+            houses, total = self._fetch_buy_bucket(
+                neighborhood, type_slug, pmin, pmax
+            )
+            for hid, hdata in houses.items():
+                seen.setdefault(hid, hdata)
+            if total > len(houses) and pmax - pmin > 1:
+                mid = (pmin + pmax) // 2
+                stack.append((pmin, mid))
+                stack.append((mid + 1, pmax))
+            elif total > len(houses):
+                log.warning(
+                    "qa_buy_truncated",
+                    nb=neighborhood,
+                    type=type_slug,
+                    pmin=pmin,
+                    pmax=pmax,
+                    hits=len(houses),
+                    total=total,
+                )
+        return seen
+
     def _fetch_buy_search_houses(self, neighborhood: str) -> dict[str, dict]:
         """Bisect price range when SSR truncates (cap ~12 per page)."""
         seen: dict[str, dict] = {}
         for type_slug in self._buy_property_type_slugs():
-            stack: list[tuple[int, int]] = [
-                (settings.buy_price_min, settings.buy_price_max)
-            ]
-            while stack:
-                pmin, pmax = stack.pop()
-                houses, total = self._fetch_buy_bucket(
-                    neighborhood, type_slug, pmin, pmax
-                )
-                for hid, hdata in houses.items():
-                    seen.setdefault(hid, hdata)
-                if total > len(houses) and pmax - pmin > 1:
-                    mid = (pmin + pmax) // 2
-                    stack.append((pmin, mid))
-                    stack.append((mid + 1, pmax))
-                elif total > len(houses):
-                    log.warning(
-                        "qa_buy_truncated",
-                        nb=neighborhood,
-                        type=type_slug,
-                        pmin=pmin,
-                        pmax=pmax,
-                        hits=len(houses),
-                        total=total,
-                    )
+            for hid, hdata in self._fetch_buy_type_houses(
+                neighborhood, type_slug
+            ).items():
+                seen.setdefault(hid, hdata)
         return seen
+
+    def _fetch_buy_nb_type(self, nb: str, type_slug: str) -> list[Listing]:
+        houses = self._fetch_buy_type_houses(nb, type_slug)
+        out: list[Listing] = []
+        for hid, hdata in houses.items():
+            lst = self._parse_buy_search_hit(hid, hdata, nb)
+            if lst:
+                out.append(lst)
+        return out
 
     def _parse_buy_search_hit(
         self, hid: str, raw: dict[str, Any], nb: str
@@ -458,6 +483,18 @@ class QuintoAndarSource(Source):
                 lst = self._parse_buy_search_hit(hid, hdata, nb)
                 if lst:
                     yield lst
+
+    def search_tasks(
+        self, neighborhoods: list[str], kind: str
+    ) -> list[Callable[[], list[Listing]]]:
+        if kind == "buy":
+            type_slugs = self._buy_property_type_slugs()
+            return [
+                (lambda nb=nb, ts=ts: self._fetch_buy_nb_type(nb, ts))
+                for nb in neighborhoods
+                for ts in type_slugs
+            ]
+        return [(lambda nb=nb: self._fetch_rent_nb_listings(nb)) for nb in neighborhoods]
 
     def _enrich_buy(self, lst: Listing) -> None:
         detail = self._fetch_buy_detail(lst.external_id)

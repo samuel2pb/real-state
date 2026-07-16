@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 import structlog
 
@@ -338,66 +338,86 @@ class ZapSource(Source):
             ),
         )
 
+    def _fetch_rent_nb(self, nb: str, size: int = 60) -> list[Listing]:
+        try:
+            zone = self._resolve_zone(nb)
+        except Exception as e:
+            log.warning("zap_skip_nb", nb=nb, err=str(e))
+            return []
+        out: list[Listing] = []
+        page = 1
+        while True:
+            r = self.http.get(GLUE_API, params=self._params(nb, zone, page, size))
+            data = r.json()
+            hits = (
+                ((data.get("search") or {}).get("result") or {}).get("listings")
+            ) or []
+            log.info("zap_page", nb=nb, page=page, hits=len(hits))
+            if not hits:
+                break
+            for raw in hits:
+                lst = self._parse_one(raw, nb)
+                if lst:
+                    out.append(lst)
+            if len(hits) < size:
+                break
+            page += 1
+            if page > 20:
+                break
+        return out
+
+    def _fetch_buy_nb_ut(self, nb: str, ut: str, size: int = 24) -> list[Listing]:
+        try:
+            zone = self._resolve_zone(nb)
+        except Exception as e:
+            log.warning("zap_buy_skip_nb", nb=nb, err=str(e))
+            return []
+        out: list[Listing] = []
+        page = 1
+        while True:
+            r = self.http.get(
+                GLUE_API,
+                params=self._buy_params(nb, zone, page, size, ut),
+            )
+            data = r.json()
+            hits = (
+                ((data.get("search") or {}).get("result") or {}).get("listings")
+            ) or []
+            log.info("zap_buy_page", nb=nb, ut=ut, page=page, hits=len(hits))
+            if not hits:
+                break
+            for raw in hits:
+                lst = self._parse_buy_one(raw, nb)
+                if lst:
+                    out.append(lst)
+            if len(hits) < size:
+                break
+            page += 1
+            if page > 20:
+                break
+        return out
+
     def search_rent(self, neighborhoods: list[str]) -> Iterator[Listing]:
-        size = 60
         for nb in neighborhoods:
-            try:
-                zone = self._resolve_zone(nb)
-            except Exception as e:
-                log.warning("zap_skip_nb", nb=nb, err=str(e))
-                continue
-            page = 1
-            while True:
-                r = self.http.get(GLUE_API, params=self._params(nb, zone, page, size))
-                data = r.json()
-                hits = (
-                    ((data.get("search") or {}).get("result") or {}).get("listings")
-                ) or []
-                log.info("zap_page", nb=nb, page=page, hits=len(hits))
-                if not hits:
-                    break
-                for raw in hits:
-                    lst = self._parse_one(raw, nb)
-                    if lst:
-                        yield lst
-                if len(hits) < size:
-                    break
-                page += 1
-                if page > 20:
-                    break
+            yield from self._fetch_rent_nb(nb)
 
     def search_buy(self, neighborhoods: list[str]) -> Iterator[Listing]:
-        size = 24
         unit_types = _zap_buy_unit_types()
         for nb in neighborhoods:
-            try:
-                zone = self._resolve_zone(nb)
-            except Exception as e:
-                log.warning("zap_buy_skip_nb", nb=nb, err=str(e))
-                continue
             for ut in unit_types:
-                page = 1
-                while True:
-                    r = self.http.get(
-                        GLUE_API,
-                        params=self._buy_params(nb, zone, page, size, ut),
-                    )
-                    data = r.json()
-                    hits = (
-                        ((data.get("search") or {}).get("result") or {}).get("listings")
-                    ) or []
-                    log.info("zap_buy_page", nb=nb, ut=ut, page=page, hits=len(hits))
-                    if not hits:
-                        break
-                    for raw in hits:
-                        lst = self._parse_buy_one(raw, nb)
-                        if lst:
-                            yield lst
-                    if len(hits) < size:
-                        break
-                    page += 1
-                    if page > 20:
-                        break
+                yield from self._fetch_buy_nb_ut(nb, ut)
+
+    def search_tasks(
+        self, neighborhoods: list[str], kind: str
+    ) -> list[Callable[[], list[Listing]]]:
+        if kind == "buy":
+            unit_types = _zap_buy_unit_types()
+            return [
+                (lambda nb=nb, ut=ut: self._fetch_buy_nb_ut(nb, ut))
+                for nb in neighborhoods
+                for ut in unit_types
+            ]
+        return [(lambda nb=nb: self._fetch_rent_nb(nb)) for nb in neighborhoods]
 
     def check_alive(self, listing: Listing) -> bool:
         try:
