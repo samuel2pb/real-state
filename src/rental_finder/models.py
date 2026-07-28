@@ -26,11 +26,14 @@ class Listing:
     distance_km: float | None = None
     first_seen: date = field(default_factory=date.today)
     last_seen: date = field(default_factory=date.today)
-    status: str = "available"  # "available" | "gone" | "price-up"
+    status: str = "available"  # "available" | "gone" | "price-up" | "price-drop"
     mode: str = "rent"          # "rent" | "buy"
     price_sale: float = 0.0     # sale price (zero for rent listings)
     condo_fee: float = 0.0      # monthly condo (display only)
     iptu: float = 0.0           # IPTU as sourced (annual on zap, unknown on qa)
+    prev_price: float | None = None      # price recorded before this drop
+    price_drop: float | None = None      # absolute BRL amount dropped (positive)
+    price_drop_pct: float | None = None  # percent dropped (positive, e.g. 4.7)
 
     @property
     def global_id(self) -> str:

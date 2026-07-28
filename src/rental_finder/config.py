@@ -42,6 +42,7 @@ class Settings(BaseSettings):
     )
     rent_pets_required: bool = True
     rent_furnished_allowed: bool = True
+    price_drop_min_pct: float = 1.0   # ignore drops smaller than this (noise)
 
     # Buy module
     notion_buy_db_id: str = ""

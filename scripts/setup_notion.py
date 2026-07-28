@@ -57,6 +57,8 @@ def _schema(kind: str = "rent") -> dict:
                 "options": [
                     {"name": "available", "color": "green"},
                     {"name": "gone", "color": "red"},
+                    {"name": "price-up", "color": "orange"},
+                    {"name": "price-drop", "color": "blue"},
                 ]
             }
         },
@@ -81,6 +83,10 @@ def _schema(kind: str = "rent") -> dict:
         "FirstSeen": {"date": {}},
         "LastSeen": {"date": {}},
         "PriceUp": {"number": {"format": "real"}},
+        "PrevPrice": {"number": {"format": "real"}},
+        "PriceDrop": {"number": {"format": "real"}},
+        "PriceDropPct": {"number": {"format": "percent"}},
+        "PriceChangedAt": {"date": {}},
     }
     if kind == "buy":
         shared["Price"] = {"number": {"format": "real"}}

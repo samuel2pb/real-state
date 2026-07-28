@@ -111,7 +111,7 @@ def _run_source(
     today: date,
     kind: str,
 ) -> tuple[dict, set[str]]:
-    sc = {"fetched": 0, "kept": 0, "upserted": 0}
+    sc = {"fetched": 0, "kept": 0, "upserted": 0, "price_drop": 0}
     seen: set[str] = set()
     seen_lock = threading.Lock()
     matches = _matches_buy_filters if kind == "buy" else _matches_filters
@@ -120,8 +120,9 @@ def _run_source(
     )
     tasks = src.search_tasks(neighborhoods, kind)
 
-    def _job(lst: Listing) -> bool:
-        return _process_listing(lst, src, store, work, today, matches, kind)
+    def _job(lst: Listing) -> tuple[bool, float | None]:
+        upserted = _process_listing(lst, src, store, work, today, matches, kind)
+        return upserted, (lst.price_drop if upserted else None)
 
     with ThreadPoolExecutor(max_workers=POOL_WORKERS) as pool:
         search_futures = [pool.submit(task) for task in tasks]
@@ -139,9 +140,12 @@ def _run_source(
                 enrich_futures.append(pool.submit(_job, lst))
         for fut in as_completed(enrich_futures):
             try:
-                if fut.result():
+                upserted, price_drop = fut.result()
+                if upserted:
                     sc["kept"] += 1
                     sc["upserted"] += 1
+                    if price_drop is not None:
+                        sc["price_drop"] += 1
             except Exception as e:
                 log.error("listing_error", source=src.name, err=str(e))
     return sc, seen
@@ -156,6 +160,7 @@ def _reconcile_alive(
     stats: dict,
 ) -> None:
     pmax = settings.buy_price_max if kind == "buy" else settings.rent_price_max
+    pmin = settings.buy_price_min if kind == "buy" else settings.rent_price_min
     stats_lock = threading.Lock()
 
     def _job(alive: dict) -> None:
@@ -177,6 +182,13 @@ def _reconcile_alive(
             with stats_lock:
                 stats["price_up"] += 1
             log.info("marked_price_up", id=f"{src_name}:{alive['external_id']}", price=price)
+        elif alive_flag and price is not None and 0 < price < pmin:
+            store.mark_price_down(
+                alive["page_id"], kind=kind, price=price, prev_price=alive.get("price")
+            )
+            with stats_lock:
+                stats["price_drop"] += 1
+            log.info("marked_price_down", id=f"{src_name}:{alive['external_id']}", price=price)
         else:
             store.mark_gone(alive["page_id"])
             with stats_lock:
@@ -198,7 +210,15 @@ def run_rent_cycle() -> dict:
     store.ensure_columns("rent")
     sources = enabled_sources()
     today = date.today()
-    stats = {"fetched": 0, "kept": 0, "upserted": 0, "gone": 0, "price_up": 0, "per_source": {}}
+    stats = {
+        "fetched": 0,
+        "kept": 0,
+        "upserted": 0,
+        "gone": 0,
+        "price_up": 0,
+        "price_drop": 0,
+        "per_source": {},
+    }
 
     seen_ids: dict[str, set[str]] = {s.name: set() for s in sources}
     completed: set[str] = set()
@@ -210,9 +230,10 @@ def run_rent_cycle() -> dict:
             stats["fetched"] += sc["fetched"]
             stats["kept"] += sc["kept"]
             stats["upserted"] += sc["upserted"]
+            stats["price_drop"] += sc["price_drop"]
             completed.add(src.name)
         except Exception as e:
-            sc = {"fetched": 0, "kept": 0, "upserted": 0}
+            sc = {"fetched": 0, "kept": 0, "upserted": 0, "price_drop": 0}
             log.error("source_error", source=src.name, err=str(e))
         stats["per_source"][src.name] = sc
         log.info("source_done", source=src.name, **sc)
@@ -228,7 +249,15 @@ def run_buy_cycle() -> dict:
     store.ensure_columns("buy")
     sources = enabled_sources(mode="buy")
     today = date.today()
-    stats = {"fetched": 0, "kept": 0, "upserted": 0, "gone": 0, "price_up": 0, "per_source": {}}
+    stats = {
+        "fetched": 0,
+        "kept": 0,
+        "upserted": 0,
+        "gone": 0,
+        "price_up": 0,
+        "price_drop": 0,
+        "per_source": {},
+    }
 
     seen_ids: dict[str, set[str]] = {s.name: set() for s in sources}
     completed: set[str] = set()
@@ -240,9 +269,10 @@ def run_buy_cycle() -> dict:
             stats["fetched"] += sc["fetched"]
             stats["kept"] += sc["kept"]
             stats["upserted"] += sc["upserted"]
+            stats["price_drop"] += sc["price_drop"]
             completed.add(src.name)
         except Exception as e:
-            sc = {"fetched": 0, "kept": 0, "upserted": 0}
+            sc = {"fetched": 0, "kept": 0, "upserted": 0, "price_drop": 0}
             log.error("source_error", source=src.name, err=str(e))
         stats["per_source"][src.name] = sc
         log.info("source_done", source=src.name, **sc)
@@ -263,7 +293,8 @@ def recheck_gone(kind: str = "rent") -> dict:
     sources = enabled_sources(mode=kind)
     src_by_name = {s.name: s for s in sources}
     pmax = settings.buy_price_max if kind == "buy" else settings.rent_price_max
-    stats = {"examined": 0, "price_up": 0, "skipped": 0}
+    pmin = settings.buy_price_min if kind == "buy" else settings.rent_price_min
+    stats = {"examined": 0, "price_up": 0, "price_drop": 0, "skipped": 0}
 
     for gone in store.list_gone(kind=kind):
         stats["examined"] += 1
@@ -279,6 +310,12 @@ def recheck_gone(kind: str = "rent") -> dict:
             store.mark_price_up(gone["page_id"], kind=kind, price=price)
             stats["price_up"] += 1
             log.info("recheck_priceup", id=f"{src_name}:{gone['external_id']}", price=price)
+        elif alive_flag and price is not None and 0 < price < pmin:
+            store.mark_price_down(
+                gone["page_id"], kind=kind, price=price, prev_price=gone.get("price")
+            )
+            stats["price_drop"] += 1
+            log.info("recheck_pricedown", id=f"{src_name}:{gone['external_id']}", price=price)
         else:
             stats["skipped"] += 1
 

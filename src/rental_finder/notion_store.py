@@ -31,6 +31,12 @@ def _retry(fn, *a, **kw):
     raise RuntimeError("notion_retry_exhausted")
 
 
+def _stored_price(page: dict, kind: str) -> float | None:
+    prop_name = "Price" if kind == "buy" else "PriceTotal"
+    price = (page.get("properties") or {}).get(prop_name, {}).get("number")
+    return price if price else None
+
+
 class NotionStore:
     def __init__(self) -> None:
         self.client = Client(auth=settings.notion_token)
@@ -67,6 +73,14 @@ class NotionStore:
             self._ds_cache[kind] = ds_id
         return ds_id
 
+    _COLUMN_SPEC = {
+        "PriceUp": {"number": {"format": "real"}},
+        "PrevPrice": {"number": {"format": "real"}},
+        "PriceDrop": {"number": {"format": "real"}},
+        "PriceDropPct": {"number": {"format": "percent"}},
+        "PriceChangedAt": {"date": {}},
+    }
+
     def ensure_columns(self, kind: str = "rent") -> None:
         """Idempotently ensure analytics columns exist on the data source schema."""
         ds_id = self._data_source_id(kind)
@@ -75,17 +89,18 @@ class NotionStore:
                 return
         ds = _retry(self.client.data_sources.retrieve, data_source_id=ds_id)
         existing = ds.get("properties") or {}
-        if "PriceUp" not in existing:
-            _retry(
-                self.client.data_sources.update,
-                data_source_id=ds_id,
-                properties={"PriceUp": {"number": {"format": "real"}}},
-            )
-            log.info("notion_col_added", kind=kind, col="PriceUp")
+        for col, spec in self._COLUMN_SPEC.items():
+            if col not in existing:
+                _retry(
+                    self.client.data_sources.update,
+                    data_source_id=ds_id,
+                    properties={col: spec},
+                )
+                log.info("notion_col_added", kind=kind, col=col)
         with self._lock:
             self._schema_ensured.add(ds_id)
 
-    def _find(self, kind: str, external_id: str, source: str) -> str | None:
+    def _find_page(self, kind: str, external_id: str, source: str) -> dict | None:
         ds_id = self._data_source_id(kind)
         r = _retry(
             self.client.data_sources.query,
@@ -104,7 +119,7 @@ class NotionStore:
             },
         )
         results = r.get("results") or []
-        return results[0]["id"] if results else None
+        return results[0] if results else None
 
     def _properties(self, lst: Listing) -> dict:
         if lst.mode == "buy":
@@ -180,9 +195,36 @@ class NotionStore:
 
     def upsert_listing(self, lst: Listing, kind: str = "rent") -> str:
         ds_id = self._data_source_id(kind)
-        page_id = self._find(kind, lst.external_id, lst.source)
-        props = self._strip_missing(self._properties(lst))
-        if page_id:
+        page = self._find_page(kind, lst.external_id, lst.source)
+        props = self._properties(lst)
+        if page:
+            page_id = page["id"]
+            old = _stored_price(page, kind)
+            new = lst.price_sale if kind == "buy" else lst.price_total
+            if old and new and old > 0 and new > 0 and new < old:
+                drop = old - new
+                pct = drop / old * 100
+                if pct >= settings.price_drop_min_pct:
+                    props["PrevPrice"] = {"number": old}
+                    props["PriceDrop"] = {"number": drop}
+                    props["PriceDropPct"] = {"number": pct / 100}
+                    props["PriceChangedAt"] = {"date": {"start": date.today().isoformat()}}
+                    lst.prev_price = old
+                    lst.price_drop = drop
+                    lst.price_drop_pct = pct
+                    log.info(
+                        "price_drop",
+                        id=lst.global_id,
+                        prev=old,
+                        new=new,
+                        pct=round(pct, 2),
+                    )
+            elif old and new and new > old:
+                props["PrevPrice"] = {"number": None}
+                props["PriceDrop"] = {"number": None}
+                props["PriceDropPct"] = {"number": None}
+                props["PriceChangedAt"] = {"date": None}
+            props = self._strip_missing(props)
             try:
                 _retry(self.client.pages.update, page_id=page_id, properties=props)
             except APIResponseError as e:
@@ -197,6 +239,7 @@ class NotionStore:
                     raise
             log.info("notion_update", id=lst.global_id)
             return page_id
+        props = self._strip_missing(props)
         props["FirstSeen"] = {"date": {"start": lst.first_seen.isoformat()}}
         try:
             r = _retry(
@@ -247,6 +290,24 @@ class NotionStore:
             props["PriceUp"] = {"number": price}
         _retry(self.client.pages.update, page_id=page_id, properties=props)
 
+    def mark_price_down(
+        self,
+        page_id: str,
+        kind: str = "rent",
+        price: float | None = None,
+        prev_price: float | None = None,
+    ) -> None:
+        props: dict = {
+            "Status": {"select": {"name": "price-drop"}},
+            "LastSeen": {"date": {"start": date.today().isoformat()}},
+        }
+        if price is not None and prev_price is not None and prev_price > price > 0:
+            props["PrevPrice"] = {"number": prev_price}
+            props["PriceDrop"] = {"number": prev_price - price}
+            props["PriceDropPct"] = {"number": (prev_price - price) / prev_price}
+            props["PriceChangedAt"] = {"date": {"start": date.today().isoformat()}}
+        _retry(self.client.pages.update, page_id=page_id, properties=props)
+
     def _list_by_status(self, kind: str, statuses: list[str]) -> Iterator[dict]:
         ds_id = self._data_source_id(kind)
         if len(statuses) == 1:
@@ -280,13 +341,14 @@ class NotionStore:
                     "neighborhood": (p.get("Neighborhood", {}).get("select") or {}).get(
                         "name", ""
                     ),
+                    "price": _stored_price(page, kind),
                 }
             if not r.get("has_more"):
                 break
             cursor = r.get("next_cursor")
 
     def list_alive(self, kind: str = "rent") -> Iterator[dict]:
-        yield from self._list_by_status(kind, ["available", "price-up"])
+        yield from self._list_by_status(kind, ["available", "price-up", "price-drop"])
 
     def list_gone(self, kind: str = "rent") -> Iterator[dict]:
         yield from self._list_by_status(kind, ["gone"])
