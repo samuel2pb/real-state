@@ -173,6 +173,23 @@ def test_needs_search_respects_cooldown(reg):
     assert reg.needs_search("k|3") is True          # cooldown expired
 
 
+def test_claim_search_is_exclusive(reg):
+    # two listings in the same building must not both pay for a query
+    assert reg.claim_search("k|1") is True
+    assert reg.claim_search("k|1") is False
+    reg.release_search("k|1")
+    assert reg.claim_search("k|1") is True
+
+
+def test_claim_search_refuses_a_known_year(reg):
+    reg.learn("k|1", built_year=2005, source="quintoandar")
+    assert reg.claim_search("k|1") is False
+
+
+def test_claim_search_refuses_empty_key(reg):
+    assert reg.claim_search("") is False
+
+
 def test_overrides_win(tmp_path):
     csv_path = tmp_path / "overrides.csv"
     csv_path.write_text(
@@ -251,3 +268,34 @@ def test_is_apartment():
     assert condos.is_apartment(_mk(property_type="APARTMENT")) is True
     assert condos.is_apartment(_mk(property_type="Casa")) is False
     assert condos.is_apartment(_mk()) is False
+
+
+@pytest.mark.parametrize(
+    "raw,ok",
+    [
+        ("Maison D Or", True),
+        ("Ed", False),        # too short to be a name
+        ("8307", False),      # a bare number seen live at Rua Bacaetava 181
+        ("  ", False),
+        ("", False),
+        ("D'Artagnan", True),
+    ],
+)
+def test_looks_like_name(raw, ok):
+    assert condos.looks_like_name(raw) is ok
+
+
+def test_numeric_name_is_not_stored(reg):
+    reg.learn("rua bacaetava|181", name="8307", source="quintoandar")
+    assert reg.lookup("rua bacaetava|181").name == ""
+
+
+def test_numeric_name_is_not_searched(isolated_registry, monkeypatch):
+    monkeypatch.setattr(condos.settings, "condo_search_enabled", True)
+    condos.reset_run_budget()
+    calls = []
+    monkeypatch.setattr(
+        "rental_finder.condo_search.search_year", lambda **kw: calls.append(kw)
+    )
+    condos.resolve_condo(_mk(condo_key="rua bacaetava|181", condo_name_raw="8307"))
+    assert calls == []

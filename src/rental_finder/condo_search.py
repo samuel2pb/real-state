@@ -45,7 +45,9 @@ YEAR_DOMAINS = {
     "ronniesimoes.com.br",
 }
 
-# Company registries: they publish a CNPJ founding date, not a building age.
+# Company registries publish a CNPJ founding date, not a building age. Social
+# networks surfaced a year for "Habitat" (Rua Oscar Freire 1456) off an
+# instagram post — a caption is not a ficha técnica.
 BLOCKED_DOMAINS = {
     "diariocidade.com",
     "econodata.com.br",
@@ -54,6 +56,15 @@ BLOCKED_DOMAINS = {
     "casadosdados.com.br",
     "empresascnpj.com",
     "consultacnpj.com",
+    "instagram.com",
+    "facebook.com",
+    "youtube.com",
+    "tiktok.com",
+    "linkedin.com",
+    "twitter.com",
+    "x.com",
+    "pinterest.com",
+    "reddit.com",
 }
 
 MIN_YEAR = 1930

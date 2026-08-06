@@ -246,3 +246,19 @@ def test_provider_error_is_swallowed(monkeypatch):
 
     monkeypatch.setitem(condo_search.PROVIDERS, "serper", _boom)
     assert condo_search.search_year(name="X", street="Rua Y", number="1") is None
+
+
+def test_social_networks_are_blocked():
+    # an instagram caption produced a year for "Habitat" in the first live run
+    hit = _score(
+        [
+            _r(
+                "https://www.instagram.com/p/xyz",
+                "Habitat Oscar Freire 1456",
+                "construído em 2018",
+            )
+        ],
+        "Rua Oscar Freire",
+        "1456",
+    )
+    assert hit is None

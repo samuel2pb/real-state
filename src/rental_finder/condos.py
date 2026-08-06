@@ -133,6 +133,17 @@ def clean_condo_name(raw: str) -> str:
     return name.strip(" -–,")
 
 
+def looks_like_name(name: str) -> bool:
+    """Reject values that are not a building name at all.
+
+    QuintoAndar's condominium.name is free text and sometimes carries a bare
+    number ('8307' at Rua Bacaetava 181). Storing that as a condo name is worse
+    than storing nothing, and searching a year for it is a wasted credit.
+    """
+    cleaned = re.sub(r"[^0-9a-zA-ZÀ-ÿ]", "", name or "")
+    return bool(cleaned) and not cleaned.isdigit() and len(cleaned) >= 3
+
+
 def search_name(name: str) -> str:
     """Name without the generic building word, for use in a search query."""
     return _BUILDING_WORD_RE.sub("", clean_condo_name(name)).strip() or name
@@ -163,6 +174,7 @@ class CondoRegistry:
         self.path = path or (settings.cache_path / settings.condo_cache_file)
         self._lock = threading.Lock()
         self._data: dict[str, CondoInfo] = {}
+        self._searching: set[str] = set()
         self._load()
         self._load_overrides(
             overrides or (ROOT / settings.condo_overrides_file)
@@ -240,6 +252,8 @@ class CondoRegistry:
         rank = SOURCE_RANK.get(source, 0)
         with self._lock:
             info = self._data.setdefault(key, CondoInfo(key=key))
+            if name and not looks_like_name(name):
+                name = None
             if name and rank >= SOURCE_RANK.get(info.name_source, 0):
                 info.name_raw = meta.get("name_raw") or name
                 info.name = clean_condo_name(name)
@@ -271,6 +285,29 @@ class CondoRegistry:
         except ValueError:
             return True
         return date.today() - last >= timedelta(days=settings.condo_search_retry_days)
+
+    def claim_search(self, key: str) -> bool:
+        """Atomically reserve the right to search this building.
+
+        Without this, two listings in the same building both pass needs_search()
+        before either writes and the query is paid for twice — observed live on
+        'Isola di Palamos' and 'San Juan San Justin'.
+        """
+        if not key:
+            return False
+        with self._lock:
+            if key in self._searching:
+                return False
+            self._searching.add(key)
+        if not self.needs_search(key):
+            with self._lock:
+                self._searching.discard(key)
+            return False
+        return True
+
+    def release_search(self, key: str) -> None:
+        with self._lock:
+            self._searching.discard(key)
 
     def stats(self) -> dict:
         with self._lock:
@@ -347,26 +384,33 @@ def resolve_condo(lst: Listing, *, allow_search: bool = True) -> None:
         return
     if not (allow_search and settings.condo_search_enabled):
         return
-    if not reg.needs_search(lst.condo_key) or not _take_search_slot():
+    if not looks_like_name(lst.condo_name or lst.condo_name_raw):
         return
+    if not reg.claim_search(lst.condo_key):
+        return
+    try:
+        if not _take_search_slot():
+            return
 
-    from .condo_search import search_year
+        from .condo_search import search_year
 
-    with _search_budget:
-        hit = search_year(
-            name=search_name(lst.condo_name or lst.condo_name_raw),
-            street=lst.condo_street,
-            number=lst.condo_number,
-            neighborhood=lst.neighborhood,
+        with _search_budget:
+            hit = search_year(
+                name=search_name(lst.condo_name or lst.condo_name_raw),
+                street=lst.condo_street,
+                number=lst.condo_number,
+                neighborhood=lst.neighborhood,
+            )
+        reg.learn(
+            lst.condo_key,
+            built_year=hit.year if hit else None,
+            source="search",
+            searched_at=date.today().isoformat(),
+            year_confidence=hit.confidence if hit else "",
+            year_source_url=hit.url if hit else "",
         )
-    reg.learn(
-        lst.condo_key,
-        built_year=hit.year if hit else None,
-        source="search",
-        searched_at=date.today().isoformat(),
-        year_confidence=hit.confidence if hit else "",
-        year_source_url=hit.url if hit else "",
-    )
-    if hit:
-        lst.apply_built_year(hit.year)
-        lst.condo_source = "search"
+        if hit:
+            lst.apply_built_year(hit.year)
+            lst.condo_source = "search"
+    finally:
+        reg.release_search(lst.condo_key)

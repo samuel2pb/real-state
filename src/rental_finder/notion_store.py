@@ -86,6 +86,10 @@ class NotionStore:
         "CondoSource": {"select": {}},
     }
 
+    # list_alive filters on every one of these, and Notion 400s a query that
+    # names a select option the property does not have.
+    STATUS_OPTIONS = ("available", "gone", "price-up", "price-drop")
+
     def ensure_columns(self, kind: str = "rent") -> None:
         """Idempotently ensure analytics columns exist on the data source schema."""
         ds_id = self._data_source_id(kind)
@@ -102,8 +106,29 @@ class NotionStore:
                     properties={col: spec},
                 )
                 log.info("notion_col_added", kind=kind, col=col)
+        self._ensure_status_options(ds_id, existing, kind)
         with self._lock:
             self._schema_ensured.add(ds_id)
+
+    def _ensure_status_options(self, ds_id: str, existing: dict, kind: str) -> None:
+        """Add any missing Status select options, preserving the existing ones."""
+        current = ((existing.get("Status") or {}).get("select") or {}).get("options")
+        if current is None:
+            return  # no Status property yet; setup_notion owns creating it
+        have = {o.get("name") for o in current}
+        missing = [s for s in self.STATUS_OPTIONS if s not in have]
+        if not missing:
+            return
+        merged = [
+            {k: v for k, v in o.items() if k in ("name", "color", "id")}
+            for o in current
+        ] + [{"name": s} for s in missing]
+        _retry(
+            self.client.data_sources.update,
+            data_source_id=ds_id,
+            properties={"Status": {"select": {"options": merged}}},
+        )
+        log.info("notion_status_options_added", kind=kind, added=missing)
 
     def _find_page(self, kind: str, external_id: str, source: str) -> dict | None:
         ds_id = self._data_source_id(kind)
