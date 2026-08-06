@@ -22,7 +22,11 @@ from .http_client import CurlSession
 
 log = structlog.get_logger(__name__)
 
-# Domains known to publish a building's ficha técnica.
+# Domains known to publish a building's ficha técnica. These do NOT gate
+# extraction — the long tail of small brokerages is often the only site that
+# publishes the year (oportunidadesraras.com.br was the sole source of
+# Mustique's "Ano de construção. 2004"). Agreement between two of these is what
+# earns "high" confidence; the real gates are BLOCKED_DOMAINS + corroboration.
 YEAR_DOMAINS = {
     "loft.com.br",
     "imovelweb.com.br",
@@ -59,7 +63,9 @@ _EXPLICIT_YEAR_RE = re.compile(
     r"(?:constru[íi]d[oa]|entregue|inaugurad[oa]|lan[çc]ad[oa])"
     r"(?:\s+(?:pel[ao]\s+\S+|em|no ano de|na d[ée]cada de))?"
     r"[^.,;]{0,40}?\b((?:19|20)\d{2})\b"
-    r"|ano\s+de\s+constru[çc][ãa]o\s*[:\-]?\s*\b((?:19|20)\d{2})\b"
+    # "Ano de construção. 2004 (22 anos)" — the separator is whatever the site
+    # renders between the label and the value, not necessarily a colon.
+    r"|ano\s+de\s+constru[çc][ãa]o\b[\s:.\-–—|·,]{0,6}\b((?:19|20)\d{2})\b"
     r"|constru[çc][ãa]o\s+de\s+\b((?:19|20)\d{2})\b",
     re.I,
 )
@@ -94,6 +100,13 @@ def build_query(name: str, street: str, number: str, neighborhood: str) -> str:
         parts.append(neighborhood)
     parts.append(f"{settings.buy_city} ano de construção")
     return " ".join(parts)
+
+
+def build_query_strict(name: str, street: str, number: str) -> str:
+    """Fallback: force the label into the snippet. Rescued Park Lane (2023),
+    which the broad query missed entirely."""
+    addr = f'"{street}, {number}"' if street and number else f'"{street}"'
+    return f'"{name}" {addr} "ano de construção"'
 
 
 def _corroborates(text: str, street: str, number: str) -> bool:
@@ -133,8 +146,6 @@ def _score(results: list[dict], street: str, number: str) -> YearHit | None:
         dom = _domain(url)
         if not dom or dom in BLOCKED_DOMAINS:
             continue
-        if dom not in YEAR_DOMAINS:
-            continue
         text = " ".join(
             filter(None, [r.get("title"), r.get("snippet") or r.get("description")])
         )
@@ -155,9 +166,14 @@ def _score(results: list[dict], street: str, number: str) -> YearHit | None:
     )
     entries = votes[best_year]
     domains = {d for d, _, _ in entries}
+    known = domains & YEAR_DOMAINS
     conflicting = len(votes) > 1
     explicit = all(c == "high" for _, _, c in entries)
-    confidence = "high" if (len(domains) >= 2 and explicit and not conflicting) else "medium"
+    confidence = (
+        "high"
+        if (len(domains) >= 2 and known and explicit and not conflicting)
+        else "medium"
+    )
     if conflicting:
         log.info(
             "condo_year_conflict",
@@ -182,6 +198,8 @@ def _http() -> CurlSession:
 
 
 def _serper(query: str) -> list[dict]:
+    # num must stay 10: a free account gets HTTP 400 "Query pattern not allowed
+    # for free accounts" for anything larger.
     r = _http().post(
         "https://google.serper.dev/search",
         json={"q": query, "gl": "br", "hl": "pt-br", "num": 10},
@@ -232,18 +250,27 @@ def search_year(
             log.warning("condo_search_no_key", provider=settings.condo_search_provider)
         return None
     number = first_number(number)
-    query = build_query(name, street, number, neighborhood)
     provider = PROVIDERS.get(settings.condo_search_provider)
     if provider is None:
         log.error("condo_search_bad_provider", provider=settings.condo_search_provider)
         return None
-    try:
-        results = provider(query)
-    except Exception as e:
-        log.warning("condo_search_err", name=name, err=str(e)[:200])
-        return None
 
-    hit = _score(results, street, number)
+    # Broad query first; the strict one only when it misses, so the second
+    # credit is spent only on buildings that need it.
+    queries = [
+        build_query(name, street, number, neighborhood),
+        build_query_strict(name, street, number),
+    ]
+    hit, results = None, []
+    for query in queries:
+        try:
+            results = provider(query)
+        except Exception as e:
+            log.warning("condo_search_err", name=name, err=str(e)[:200])
+            return None
+        hit = _score(results, street, number)
+        if hit:
+            break
     if hit and settings.condo_search_min_confidence == "high" and hit.confidence != "high":
         log.info("condo_search_low_conf", name=name, year=hit.year, conf=hit.confidence)
         hit = None

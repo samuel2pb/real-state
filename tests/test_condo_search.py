@@ -30,6 +30,9 @@ def _r(url, title, snippet):
             (2005, "high"),
         ),
         ("Construído em 1995 (há 29 anos)", (1995, "high")),
+        # the separator is whatever the site renders, not necessarily a colon
+        ("Ano de construção. 2004 (22 anos). Ver mais", (2004, "high")),
+        ("Ano de construção · 1988", (1988, "high")),
         ("Prédio entregue há 29 anos", (YEAR - 29, "medium")),
         ("7 imóveis à venda no Le Grand Palais", None),
         ("empresa fundada em 21/01/1985", None),
@@ -105,13 +108,32 @@ def test_wrong_address_rejected():
     assert hit is None
 
 
-def test_unlisted_domain_ignored():
+def test_unlisted_domain_still_counts_at_medium():
+    # a small brokerage is often the ONLY site publishing the year
     hit = _score(
-        [_r("https://algum-blog.com/post", "Mustique Rua Arandu, 222", "construído em 2005")],
+        [
+            _r(
+                "https://www.oportunidadesraras.com.br/x",
+                "Apartamento no condomínio Mustique, Rua Arandu, 222",
+                "Ano de construção. 2004 (22 anos).",
+            )
+        ],
         "Rua Arandu",
         "222",
     )
-    assert hit is None
+    assert (hit.year, hit.confidence) == (2004, "medium")
+
+
+def test_two_unknown_domains_stay_medium():
+    hit = _score(
+        [
+            _r("https://algum-blog.com/a", "Mustique Rua Arandu, 222", "construído em 2005"),
+            _r("https://outro-blog.com/b", "Mustique Rua Arandu 222", "construído em 2005"),
+        ],
+        "Rua Arandu",
+        "222",
+    )
+    assert (hit.year, hit.confidence) == (2005, "medium")
 
 
 def test_conflicting_years_take_modal_and_drop_to_medium():
@@ -137,6 +159,48 @@ def test_no_results_is_none():
 def test_search_year_without_api_key_returns_none(monkeypatch):
     monkeypatch.setattr(condo_search.settings, "condo_search_api_key", "")
     assert condo_search.search_year(name="X", street="Rua Y", number="1") is None
+
+
+def test_strict_query_forces_the_label():
+    q = condo_search.build_query_strict("Park Lane", "Rua Min. Gabriel", "319")
+    assert q == '"Park Lane" "Rua Min. Gabriel, 319" "ano de construção"'
+
+
+def test_falls_back_to_strict_query_on_miss(monkeypatch):
+    monkeypatch.setattr(condo_search.settings, "condo_search_api_key", "k")
+    seen = []
+
+    def _fake(q):
+        seen.append(q)
+        if not q.endswith('"ano de construção"'):  # the broad query
+            return [_r("https://loft.com.br/c/x", "Park Lane - Rua Min. Gabriel, 319", "sem dados")]
+        return [
+            _r(
+                "https://manoelimoveis.com.br/i/y",
+                "Park Lane Rua Min. Gabriel, 319",
+                "Ano de construção. 2023",
+            )
+        ]
+
+    monkeypatch.setitem(condo_search.PROVIDERS, "serper", _fake)
+    hit = condo_search.search_year(
+        name="Park Lane", street="Rua Min. Gabriel", number="319", neighborhood="Moema"
+    )
+    assert len(seen) == 2          # second credit spent only because the first missed
+    assert hit.year == 2023
+
+
+def test_no_second_query_when_the_first_hits(monkeypatch):
+    monkeypatch.setattr(condo_search.settings, "condo_search_api_key", "k")
+    seen = []
+
+    def _fake(q):
+        seen.append(q)
+        return [_r("https://loft.com.br/c/x", "Rousseau - Alameda Jauaperi, 1120", "construído em 1982")]
+
+    monkeypatch.setitem(condo_search.PROVIDERS, "serper", _fake)
+    condo_search.search_year(name="Rousseau", street="Alameda Jauaperi", number="1120")
+    assert len(seen) == 1
 
 
 def test_search_year_end_to_end(monkeypatch):
