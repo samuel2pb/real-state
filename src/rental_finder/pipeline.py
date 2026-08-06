@@ -6,6 +6,7 @@ from datetime import date
 
 import structlog
 
+from .condos import is_apartment, registry, reset_run_budget, resolve_condo
 from .config import settings
 from .geo import distance_km, work_coords
 from .models import Listing
@@ -88,6 +89,12 @@ def _process_listing(
 ) -> bool:
     """Enrich + filter + upsert one listing. Returns True if upserted."""
     src.enrich(lst)
+    if settings.condo_enrich_enabled and kind == "buy" and is_apartment(lst):
+        # display/analytics only — never allowed to drop a listing
+        try:
+            resolve_condo(lst)
+        except Exception as e:
+            log.warning("condo_resolve_err", id=lst.global_id, err=str(e)[:200])
     _annotate_distance(lst, work)
     if (
         lst.distance_km is not None
@@ -249,6 +256,7 @@ def run_buy_cycle() -> dict:
     store.ensure_columns("buy")
     sources = enabled_sources(mode="buy")
     today = date.today()
+    reset_run_budget()
     stats = {
         "fetched": 0,
         "kept": 0,
@@ -279,6 +287,74 @@ def run_buy_cycle() -> dict:
 
     src_by_name = {s.name: s for s in sources}
     _reconcile_alive(store, src_by_name, seen_ids, completed, "buy", stats)
+    if settings.condo_enrich_enabled:
+        stats["condo"] = registry().stats()
+    return stats
+
+
+def backfill_condos(kind: str = "buy", max_searches: int | None = None) -> dict:
+    """Fill condo columns on existing Notion rows.
+
+    Rows written before the CondoKey column existed have no key and are skipped;
+    they self-heal on the next cycle. Not called from the run cycles.
+    """
+    if max_searches is not None:
+        settings.condo_search_max_per_run = max_searches
+    store = NotionStore()
+    store.ensure_columns(kind)
+    reset_run_budget()
+    stats = {"examined": 0, "skipped": 0, "named": 0, "dated": 0, "updated": 0}
+    stats_lock = threading.Lock()
+
+    def _job(row: dict) -> None:
+        with stats_lock:
+            stats["examined"] += 1
+        if not row.get("condo_key"):
+            with stats_lock:
+                stats["skipped"] += 1
+            return
+        lst = Listing(
+            source=row["source"],
+            external_id=row["external_id"],
+            url=row["url"],
+            neighborhood=row.get("neighborhood") or "",
+            price_rent=0.0,
+            price_total=0.0,
+            bedrooms=0,
+            bathrooms=0,
+            suites=0,
+            parking=0,
+            sqm=0.0,
+            pets=False,
+            furnished=None,
+            lat=None,
+            lng=None,
+            mode=kind,
+            condo_key=row["condo_key"],
+            condo_name=row.get("condo_name") or "",
+        )
+        year = row.get("built_year")
+        if year:
+            lst.apply_built_year(int(year))
+        resolve_condo(lst)
+        if not (lst.condo_name or lst.built_year):
+            return
+        store.update_condo(row["page_id"], lst)
+        with stats_lock:
+            stats["updated"] += 1
+            if lst.condo_name:
+                stats["named"] += 1
+            if lst.built_year:
+                stats["dated"] += 1
+
+    with ThreadPoolExecutor(max_workers=POOL_WORKERS) as pool:
+        futures = [pool.submit(_job, row) for row in store.list_alive(kind=kind)]
+        for fut in as_completed(futures):
+            try:
+                fut.result()
+            except Exception as e:
+                log.error("condo_backfill_error", kind=kind, err=str(e))
+    stats["registry"] = registry().stats()
     return stats
 
 

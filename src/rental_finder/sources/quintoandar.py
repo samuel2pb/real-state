@@ -418,6 +418,22 @@ class QuintoAndarSource(Source):
                 out.append(lst)
         return out
 
+    @staticmethod
+    def _is_classified(raw: dict[str, Any]) -> bool:
+        """Partner classifieds live on a different stack than QA's own listings.
+
+        They are ~2/3 of the buy result set and their detail page is served at
+        /classificado/<id>/comprar — /imovel/<id>/comprar redirects those to
+        /indisponivel and returns an unhydrated shell.
+        """
+        return "CLASSIFIED" in (raw.get("listingTags") or []) or (
+            raw.get("recommendationListingOrigin") == "CLASSIFIED"
+        )
+
+    def _buy_detail_url(self, hid: str, classified: bool) -> str:
+        route = "classificado" if classified else "imovel"
+        return f"{BASE}/{route}/{hid}/comprar"
+
     def _parse_buy_search_hit(
         self, hid: str, raw: dict[str, Any], nb: str
     ) -> Listing | None:
@@ -435,7 +451,7 @@ class QuintoAndarSource(Source):
             source=self.name,
             mode="buy",
             external_id=hid,
-            url=f"{BASE}/imovel/{hid}/comprar",
+            url=self._buy_detail_url(hid, self._is_classified(raw)),
             neighborhood=neighborhood,
             price_rent=0.0,
             price_total=sale_price,
@@ -455,11 +471,14 @@ class QuintoAndarSource(Source):
             address=f"{addr_str}, {neighborhood}" if addr_str else neighborhood,
         )
 
-    def _fetch_buy_detail(self, house_id: str) -> dict[str, Any] | None:
+    def _fetch_buy_detail(
+        self, house_id: str, url: str | None = None
+    ) -> dict[str, Any] | None:
         # The bare /imovel/<id> URL 301-redirects to /imovel/<id>/alugar/<slug>
         # which 404s for sale-only listings. /imovel/<id>/comprar resolves to
-        # the sale detail page via a 301 to its slugged form.
-        url = f"{BASE}/imovel/{house_id}/comprar"
+        # the sale detail page via a 301 to its slugged form. Partner classifieds
+        # need /classificado/<id>/comprar instead — pass their URL explicitly.
+        url = url or f"{BASE}/imovel/{house_id}/comprar"
         try:
             r = self.http.get(url, headers={"Accept": "text/html"})
         except Exception as e:
@@ -496,8 +515,47 @@ class QuintoAndarSource(Source):
             ]
         return [(lambda nb=nb: self._fetch_rent_nb_listings(nb)) for nb in neighborhoods]
 
+    def _apply_condo(self, lst: Listing, hi: dict[str, Any]) -> None:
+        """Capture building identity + native construction year from houseInfo.
+
+        `condominium.name` lands on ~100% of listings; `constructionYear` on
+        ~10% — the rest is resolved later by condos.resolve_condo().
+        """
+        from ..condos import condo_key, normalize_cep, registry, split_street_number
+
+        cond = hi.get("condominium") or {}
+        raw_name = (cond.get("name") or "").strip()
+        street, number = split_street_number(
+            cond.get("address") or (hi.get("address") or {}).get("street") or "",
+            cond.get("number"),
+        )
+        cep = normalize_cep((hi.get("address") or {}).get("zipCode") or "")
+        key = condo_key(street, number)
+        lst.condo_name_raw = raw_name
+        lst.condo_street = street
+        lst.condo_number = number
+        lst.condo_key = key
+        lst.condo_hash = cond.get("hashId") or ""
+        year = hi.get("constructionYear")
+        if year:
+            lst.apply_built_year(int(year))
+            lst.condo_source = "quintoandar"
+        if not key:
+            return
+        registry().learn(
+            key,
+            name=raw_name or None,
+            built_year=int(year) if year else None,
+            source="quintoandar",
+            year_confidence="high" if year else "",
+            street=street,
+            number=number,
+            cep=cep,
+            qa_hash=lst.condo_hash,
+        )
+
     def _enrich_buy(self, lst: Listing) -> None:
-        detail = self._fetch_buy_detail(lst.external_id)
+        detail = self._fetch_buy_detail(lst.external_id, lst.url)
         if not detail:
             return
         markers = detail.get("markers") or {}
@@ -517,6 +575,8 @@ class QuintoAndarSource(Source):
             lst.pets = bool(hi["acceptsPets"])
         if hi.get("hasFurniture") is not None:
             lst.furnished = bool(hi["hasFurniture"])
+        if settings.condo_enrich_enabled:
+            self._apply_condo(lst, hi)
 
     def enrich(self, lst: Listing) -> None:
         if lst.mode == "buy":
@@ -527,7 +587,7 @@ class QuintoAndarSource(Source):
     def recheck(self, *, external_id: str, url: str, kind: str) -> tuple[bool, float | None]:
         """Re-fetch a single listing to distinguish truly-gone vs price-up."""
         detail = (
-            self._fetch_buy_detail(external_id)
+            self._fetch_buy_detail(external_id, url)
             if kind == "buy"
             else self._fetch_detail(external_id)
         )

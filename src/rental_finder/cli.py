@@ -54,6 +54,48 @@ def recheck_gone_cmd(
         typer.echo({"kind": "buy", **stats})
 
 
+@app.command("condo-backfill")
+def condo_backfill_cmd(
+    kind: str = typer.Option("buy", help="'buy' or 'rent'"),
+    max_searches: int = typer.Option(
+        0, help="Cap web searches this run (0 = use CONDO_SEARCH_MAX_PER_RUN)"
+    ),
+) -> None:
+    """Fill CondoName/BuiltYear/CondoAge on existing Notion rows."""
+    _init_logging()
+    from .pipeline import backfill_condos
+
+    stats = backfill_condos(kind=kind, max_searches=max_searches or None)
+    typer.echo({"kind": kind, **stats})
+
+
+@app.command("condo-stats")
+def condo_stats_cmd() -> None:
+    """Print what the local condo registry knows."""
+    _init_logging()
+    from .condos import registry
+
+    typer.echo(registry().stats())
+
+
+@app.command("condo-search")
+def condo_search_cmd(
+    name: str = typer.Argument(..., help="Condo name, e.g. 'Mustique'"),
+    street: str = typer.Argument(..., help="Street, e.g. 'Rua Arandu'"),
+    number: str = typer.Argument(..., help="Street number, e.g. '222'"),
+    neighborhood: str = typer.Option("", help="Neighborhood, sharpens the query"),
+) -> None:
+    """One-shot debug of the year search: query, results, extraction."""
+    _init_logging()
+    from .condo_search import build_query, search_year
+
+    typer.echo(build_query(name, street, number, neighborhood))
+    hit = search_year(
+        name=name, street=street, number=number, neighborhood=neighborhood
+    )
+    typer.echo(hit if hit else "no year found")
+
+
 @app.command("schedule")
 def schedule() -> None:
     """Start the cron scheduler (blocking)."""

@@ -27,6 +27,10 @@ cp .env.example .env   # then edit .env (NOTION_TOKEN etc.)
 uv run rental-finder geo         # warm geocoding cache (runs once, ~15s)
 uv run rental-finder run-once    # one full fetch → filter → upsert cycle
 uv run rental-finder schedule    # start the cron scheduler (blocking)
+
+uv run rental-finder condo-stats                       # what the condo registry knows
+uv run rental-finder condo-backfill --kind buy --max 20  # fill condo cols on existing rows
+uv run rental-finder condo-search Mustique "Rua Arandu" 222  # debug one year lookup
 ```
 
 Run `schedule` inside a VPN session. The HTTP stack uses `curl-cffi` w/ Chrome TLS impersonation + exponential backoff on 403/429 — tolerant to IP changes.
@@ -45,8 +49,27 @@ All params live in `.env`. Key groups:
 | Schedule | `SCHEDULE_CRON_TIMES` (comma-separated cron exprs), `SCHEDULE_TZ` |
 | HTTP | `HTTP_IMPERSONATE`, `HTTP_MIN/MAX_DELAY_SEC`, `HTTP_MAX_RETRIES`, `HTTP_PLAYWRIGHT_FALLBACK` |
 | Sources | `SOURCE_ZAPIMOVEIS_ENABLED`, `SOURCE_QUINTOANDAR_ENABLED` |
+| Condo (buy) | `CONDO_ENRICH_ENABLED`, `CONDO_SEARCH_ENABLED`, `CONDO_SEARCH_PROVIDER`, `CONDO_SEARCH_API_KEY`, `CONDO_SEARCH_MAX_PER_RUN`, `CONDO_SEARCH_MIN_CONFIDENCE` |
 
 See `.env.example` for the full annotated list.
+
+### Condo name + build year + age (buy, QuintoAndar only)
+
+Apartment rows get `CondoName`, `BuiltYear`, `CondoAge` and `CondoSource` in Notion.
+
+- **Name** comes free from the QuintoAndar detail page — it is already fetched during enrich.
+- **Year** is served by QuintoAndar on only ~10% of listings. The rest is resolved from
+  web-search snippets: one query per *building*, cached forever in `.cache/condos.json`,
+  so the quota cost is a few hundred queries total. Leave `CONDO_SEARCH_API_KEY` blank to
+  keep the search tier off — names still land, years stay sparse.
+- Buildings are keyed by normalized street + number, so a name learned from one listing
+  fills in every other unit in the same building, including partner classifieds that
+  publish no condominium block of their own.
+- Condo data is display/analytics only — it never filters a listing out.
+- `condo_overrides.csv` at the repo root (`key,name,built_year`) overrides everything;
+  use it to hand-fix a building the search got wrong.
+
+Details and the field-coverage measurements are in [PLAN-CONDO-AGE.md](PLAN-CONDO-AGE.md).
 
 ---
 
@@ -60,6 +83,8 @@ sources/
   base.py         ← Source ABC (search_rent, check_alive)
   zapimoveis.py   ← glue-api w/ zone-discovery cache
   quintoandar.py  ← yellow-pages JSON w/ bbox filters
+condos.py      ← building key, name cleanup, registry (.cache/condos.json)
+condo_search.py← year from SERP snippets (serper/brave/google_cse adapters)
 http_client.py ← curl-cffi session, pacing, retry, cookie persist
 notion_store.py← upsert / mark_gone / list_alive via data_sources.query
 geo.py         ← Nominatim geocode + haversine distance, cached

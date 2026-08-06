@@ -65,6 +65,19 @@ class Settings(BaseSettings):
     buy_pets_required: bool = False
     buy_furnished_allowed: bool = True
 
+    # Condo enrichment (name + build year + age)
+    condo_enrich_enabled: bool = True
+    condo_apartment_types: str = "Apartamento,APARTMENT"
+    condo_cache_file: str = "condos.json"
+    condo_overrides_file: str = "condo_overrides.csv"
+    condo_search_enabled: bool = True
+    condo_search_provider: Literal["serper", "brave", "google_cse"] = "serper"
+    condo_search_api_key: str = ""
+    condo_search_cse_id: str = ""      # google_cse only
+    condo_search_max_per_run: int = 50
+    condo_search_min_confidence: Literal["medium", "high"] = "medium"
+    condo_search_retry_days: int = 90  # don't re-query a miss before this
+
     work_address: str
     work_max_distance_km: float = 5.5
     work_lat: float | None = None
@@ -105,6 +118,14 @@ class Settings(BaseSettings):
         if raw:
             return [n.strip() for n in raw.split(",") if n.strip()]
         return self.neighborhoods_list  # fallback to rent list
+
+    @property
+    def condo_apartment_types_list(self) -> list[str]:
+        return [
+            t.strip().lower()
+            for t in self.condo_apartment_types.split(",")
+            if t.strip()
+        ]
 
     @property
     def modules_list(self) -> list[str]:

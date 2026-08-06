@@ -79,6 +79,11 @@ class NotionStore:
         "PriceDrop": {"number": {"format": "real"}},
         "PriceDropPct": {"number": {"format": "percent"}},
         "PriceChangedAt": {"date": {}},
+        "CondoName": {"rich_text": {}},
+        "CondoKey": {"rich_text": {}},
+        "BuiltYear": {"number": {"format": "number"}},
+        "CondoAge": {"number": {"format": "number"}},
+        "CondoSource": {"select": {}},
     }
 
     def ensure_columns(self, kind: str = "rent") -> None:
@@ -150,6 +155,7 @@ class NotionStore:
                     "rich_text": [{"text": {"content": (lst.address or "")[:1800]}}]
                 },
                 "LastSeen": {"date": {"start": lst.last_seen.isoformat()}},
+                **_condo_props(lst),
             }
             if lst.distance_km is not None:
                 props["DistanceKm"] = {"number": round(lst.distance_km, 2)}
@@ -308,6 +314,13 @@ class NotionStore:
             props["PriceChangedAt"] = {"date": {"start": date.today().isoformat()}}
         _retry(self.client.pages.update, page_id=page_id, properties=props)
 
+    def update_condo(self, page_id: str, lst: Listing) -> None:
+        """Patch only the condo columns on an existing page (backfill path)."""
+        props = self._strip_missing(_condo_props(lst))
+        if not props:
+            return
+        _retry(self.client.pages.update, page_id=page_id, properties=props)
+
     def _list_by_status(self, kind: str, statuses: list[str]) -> Iterator[dict]:
         ds_id = self._data_source_id(kind)
         if len(statuses) == 1:
@@ -342,6 +355,9 @@ class NotionStore:
                         "name", ""
                     ),
                     "price": _stored_price(page, kind),
+                    "condo_key": _plain(p.get("CondoKey")),
+                    "condo_name": _plain(p.get("CondoName")),
+                    "built_year": (p.get("BuiltYear") or {}).get("number"),
                 }
             if not r.get("has_more"):
                 break
@@ -352,6 +368,27 @@ class NotionStore:
 
     def list_gone(self, kind: str = "rent") -> Iterator[dict]:
         yield from self._list_by_status(kind, ["gone"])
+
+
+def _condo_props(lst: Listing) -> dict:
+    """Condo columns, null-safe. Empty values clear the cell rather than lie."""
+    return {
+        "CondoName": {
+            "rich_text": [{"text": {"content": lst.condo_name[:1800]}}]
+            if lst.condo_name
+            else []
+        },
+        "CondoKey": {
+            "rich_text": [{"text": {"content": lst.condo_key}}]
+            if lst.condo_key
+            else []
+        },
+        "BuiltYear": {"number": lst.built_year},
+        "CondoAge": {"number": lst.condo_age_years},
+        "CondoSource": {"select": {"name": lst.condo_source}}
+        if lst.condo_source
+        else {"select": None},
+    }
 
 
 def _plain(rt_prop: dict | None) -> str:
