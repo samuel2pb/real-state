@@ -76,7 +76,11 @@ class Settings(BaseSettings):
     condo_search_cse_id: str = ""      # google_cse only
     condo_search_max_per_run: int = 50
     condo_search_min_confidence: Literal["medium", "high"] = "medium"
-    condo_search_retry_days: int = 90  # don't re-query a miss before this
+    # A building the search already failed on is parked for good: the year is
+    # simply not in any snippet, and re-querying it burns credits every run.
+    # Flip this on (or run `condo-retry-misses`) after improving the extractor.
+    condo_search_retry_misses: bool = False
+    condo_search_retry_days: int = 90  # only applies when retry_misses is on
 
     work_address: str
     work_max_distance_km: float = 5.5

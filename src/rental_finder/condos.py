@@ -272,7 +272,12 @@ class CondoRegistry:
                 self._flush()
 
     def needs_search(self, key: str) -> bool:
-        """True when this building has no year and is not in the retry cooldown."""
+        """True only for a building we have never searched and have no year for.
+
+        A previous miss is parked permanently by default: the year is not in any
+        snippet for that building, so retrying it just burns a credit on every
+        run. `condo_search_retry_misses` (or clear_misses()) reopens them.
+        """
         info = self.lookup(key)
         if info is None:
             return True
@@ -280,11 +285,27 @@ class CondoRegistry:
             return False
         if not info.searched_at:
             return True
+        if not settings.condo_search_retry_misses:
+            return False
         try:
             last = date.fromisoformat(info.searched_at)
         except ValueError:
             return True
         return date.today() - last >= timedelta(days=settings.condo_search_retry_days)
+
+    def clear_misses(self) -> int:
+        """Reopen every parked miss for searching. Returns how many."""
+        with self._lock:
+            reopened = [
+                info
+                for info in self._data.values()
+                if info.searched_at and not info.built_year
+            ]
+            for info in reopened:
+                info.searched_at = ""
+            if reopened:
+                self._flush()
+        return len(reopened)
 
     def claim_search(self, key: str) -> bool:
         """Atomically reserve the right to search this building.
@@ -320,6 +341,13 @@ class CondoRegistry:
             "buildings": len(rows),
             "with_name": sum(1 for r in rows if r.name),
             "with_year": sum(1 for r in rows if r.built_year),
+            # parked: searched once, no year found, will not be queried again
+            "parked_misses": sum(
+                1 for r in rows if r.searched_at and not r.built_year
+            ),
+            "never_searched": sum(
+                1 for r in rows if not r.searched_at and not r.built_year
+            ),
             "by_year_source": by_source,
         }
 

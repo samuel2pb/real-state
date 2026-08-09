@@ -78,6 +78,32 @@ def condo_stats_cmd() -> None:
     typer.echo(registry().stats())
 
 
+@app.command("condo-retry-misses")
+def condo_retry_misses_cmd(
+    yes: bool = typer.Option(False, "--yes", help="Skip the confirmation prompt"),
+) -> None:
+    """Reopen buildings the search already failed on.
+
+    Misses are parked for good by default. Only worth reopening after the
+    extractor or the query template changed — each reopened building costs a
+    search credit again on the next run.
+    """
+    _init_logging()
+    from .condos import registry
+
+    reg = registry()
+    parked = reg.stats()["parked_misses"]
+    if not parked:
+        typer.echo("no parked misses")
+        return
+    if not yes:
+        typer.confirm(
+            f"Reopen {parked} parked buildings? They will be searched again.",
+            abort=True,
+        )
+    typer.echo({"reopened": reg.clear_misses()})
+
+
 @app.command("condo-search")
 def condo_search_cmd(
     name: str = typer.Argument(..., help="Condo name, e.g. 'Mustique'"),

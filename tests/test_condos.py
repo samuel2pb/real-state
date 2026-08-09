@@ -162,15 +162,51 @@ def test_empty_key_is_ignored(reg):
     assert reg.stats()["buildings"] == 0
 
 
-def test_needs_search_respects_cooldown(reg):
+def test_needs_search_gates(reg):
     assert reg.needs_search("k|1") is True          # unknown building
     reg.learn("k|1", built_year=2005, source="search")
     assert reg.needs_search("k|1") is False         # already has a year
+
+
+def test_a_miss_is_parked_for_good(reg, monkeypatch):
+    # the year is not in any snippet for this building; retrying burns a credit
+    # on every single run for nothing
+    monkeypatch.setattr(condos.settings, "condo_search_retry_misses", False)
     reg.learn("k|2", source="search", searched_at=date.today().isoformat())
-    assert reg.needs_search("k|2") is False         # miss, still in cooldown
+    assert reg.needs_search("k|2") is False
+    ancient = (date.today() - timedelta(days=4000)).isoformat()
+    reg.learn("k|3", source="search", searched_at=ancient)
+    assert reg.needs_search("k|3") is False         # age does not reopen it
+
+
+def test_retry_misses_reenables_the_cooldown(reg, monkeypatch):
+    monkeypatch.setattr(condos.settings, "condo_search_retry_misses", True)
+    monkeypatch.setattr(condos.settings, "condo_search_retry_days", 90)
+    reg.learn("k|2", source="search", searched_at=date.today().isoformat())
+    assert reg.needs_search("k|2") is False         # still inside the window
     old = (date.today() - timedelta(days=400)).isoformat()
     reg.learn("k|3", source="search", searched_at=old)
-    assert reg.needs_search("k|3") is True          # cooldown expired
+    assert reg.needs_search("k|3") is True          # window expired
+
+
+def test_clear_misses_reopens_only_the_yearless(reg):
+    reg.learn("k|1", built_year=2005, source="search",
+              searched_at=date.today().isoformat())
+    reg.learn("k|2", source="search", searched_at=date.today().isoformat())
+    reg.learn("k|3", source="search", searched_at=date.today().isoformat())
+    assert reg.stats()["parked_misses"] == 2
+    assert reg.clear_misses() == 2
+    assert reg.stats()["parked_misses"] == 0
+    assert reg.needs_search("k|2") is True
+    assert reg.needs_search("k|1") is False         # has a year, still skipped
+    assert reg.clear_misses() == 0                  # idempotent
+
+
+def test_stats_split_parked_from_never_searched(reg):
+    reg.learn("k|1", source="search", searched_at=date.today().isoformat())
+    reg.learn("k|2", name="Sem busca ainda", source="quintoandar")
+    s = reg.stats()
+    assert (s["parked_misses"], s["never_searched"]) == (1, 1)
 
 
 def test_claim_search_is_exclusive(reg):

@@ -31,6 +31,7 @@ uv run rental-finder schedule    # start the cron scheduler (blocking)
 uv run rental-finder condo-stats                       # what the condo registry knows
 uv run rental-finder condo-backfill --kind buy --max 20  # fill condo cols on existing rows
 uv run rental-finder condo-search Mustique "Rua Arandu" 222  # debug one year lookup
+uv run rental-finder condo-retry-misses                # reopen parked buildings
 ```
 
 Run `schedule` inside a VPN session. The HTTP stack uses `curl-cffi` w/ Chrome TLS impersonation + exponential backoff on 403/429 — tolerant to IP changes.
@@ -65,6 +66,10 @@ Apartment rows get `CondoName`, `BuiltYear`, `CondoAge` and `CondoSource` in Not
 - Buildings are keyed by normalized street + number, so a name learned from one listing
   fills in every other unit in the same building, including partner classifieds that
   publish no condominium block of their own.
+- A building is searched **once**. If no year comes back it is parked for good — the
+  year simply is not in any snippet for it, and retrying costs a credit every run.
+  `condo-stats` reports `parked_misses` vs `never_searched`; `condo-retry-misses`
+  reopens the parked ones, which is only worth doing after changing the extractor.
 - Condo data is display/analytics only — it never filters a listing out.
 - `condo_overrides.csv` at the repo root (`key,name,built_year`) overrides everything;
   use it to hand-fix a building the search got wrong.
