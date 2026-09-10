@@ -249,6 +249,9 @@ def isolated_registry(tmp_path, monkeypatch):
     reg = CondoRegistry(path=tmp_path / "condos.json", overrides=tmp_path / "none.csv")
     monkeypatch.setattr(condos, "_registry", reg)
     monkeypatch.setattr(condos.settings, "condo_search_enabled", False)
+    # The tests below exercise the legacy SERP tier; the `claude` tier has its
+    # own fixture further down.
+    monkeypatch.setattr(condos.settings, "condo_search_provider", "serper")
     return reg
 
 
@@ -335,3 +338,223 @@ def test_numeric_name_is_not_searched(isolated_registry, monkeypatch):
     )
     condos.resolve_condo(_mk(condo_key="rua bacaetava|181", condo_name_raw="8307"))
     assert calls == []
+
+
+# --- claude tier ----------------------------------------------------------
+
+
+@pytest.fixture
+def agent_registry(tmp_path, monkeypatch):
+    reg = CondoRegistry(path=tmp_path / "condos.json", overrides=tmp_path / "none.csv")
+    monkeypatch.setattr(condos, "_registry", reg)
+    monkeypatch.setattr(condos.settings, "condo_search_enabled", True)
+    monkeypatch.setattr(condos.settings, "condo_search_provider", "claude")
+    monkeypatch.setattr(condos.settings, "condo_search_min_confidence", "medium")
+    condos.reset_run_budget()
+    return reg
+
+
+def _finding(**kw):
+    from rental_finder.condo_agent import CondoFinding
+
+    return CondoFinding(**kw)
+
+
+def test_split_key():
+    assert condos.split_key("rua jose antonio coelho|603") == (
+        "rua jose antonio coelho",
+        "603",
+    )
+    assert condos.split_key("") == ("", "")
+
+
+def test_agent_gets_the_address_out_of_the_key(agent_registry, monkeypatch):
+    """A Notion backfill row carries no street; the SERP tier searched empty."""
+    seen = {}
+
+    def _fake(**kw):
+        seen.update(kw)
+        return _finding(built_year=1977, confidence="high", found_number="603")
+
+    monkeypatch.setattr("rental_finder.condo_agent.lookup_condo", _fake)
+    lst = _mk(condo_key="rua jose antonio coelho|603")
+    condos.resolve_condo(lst)
+    assert seen["street"] == "rua jose antonio coelho"
+    assert seen["number"] == "603"
+    assert lst.built_year == 1977
+    assert lst.condo_source == "claude"
+    assert lst.condo_confidence == "high"
+
+
+def test_unnamed_building_is_still_looked_up(agent_registry, monkeypatch):
+    """The SERP tier bailed without a name. Address alone is enough now."""
+    calls = []
+    monkeypatch.setattr(
+        "rental_finder.condo_agent.lookup_condo",
+        lambda **kw: calls.append(kw) or _finding(
+            built_year=1982,
+            name="Luci e Lea",
+            confidence="medium",
+            found_number="962",
+        ),
+    )
+    lst = _mk(condo_key="travessa humberto i|962")
+    condos.resolve_condo(lst)
+    assert len(calls) == 1
+    assert lst.condo_name == "Luci e Lea"
+    assert lst.built_year == 1982
+
+
+def test_low_confidence_year_is_recorded_but_not_stored(agent_registry, monkeypatch):
+    monkeypatch.setattr(
+        "rental_finder.condo_agent.lookup_condo",
+        lambda **kw: _finding(
+            built_year=1978, confidence="estimated", found_number="928"
+        ),
+    )
+    lst = _mk(condo_key="rua humberto i|928")
+    condos.resolve_condo(lst)
+    assert lst.built_year is None
+    assert lst.condo_confidence == "estimated"
+    assert agent_registry.lookup("rua humberto i|928").built_year is None
+
+
+def test_unreachable_resolver_is_not_parked(agent_registry, monkeypatch):
+    """None means we never got an answer — retry it, do not park it."""
+    monkeypatch.setattr("rental_finder.condo_agent.lookup_condo", lambda **kw: None)
+    lst = _mk(condo_key="rua estela|755")
+    condos.resolve_condo(lst)
+    assert agent_registry.needs_search("rua estela|755") is True
+
+
+def test_a_miss_is_parked(agent_registry, monkeypatch):
+    monkeypatch.setattr(
+        "rental_finder.condo_agent.lookup_condo",
+        lambda **kw: _finding(confidence="not_found", notes="no source states it"),
+    )
+    lst = _mk(condo_key="rua jose antonio coelho|750")
+    condos.resolve_condo(lst)
+    assert agent_registry.needs_search("rua jose antonio coelho|750") is False
+    assert (
+        agent_registry.lookup("rua jose antonio coelho|750").year_notes
+        == "no source states it"
+    )
+
+
+def test_quintoandar_name_outranks_the_agent(reg):
+    reg.learn("k|1", name="Maison D Or", source="quintoandar")
+    reg.learn("k|1", name="Maison Dor Residence", source="claude")
+    assert reg.lookup("k|1").name == "Maison D Or"
+
+
+def test_agent_year_outranks_quintoandar(reg):
+    reg.learn("k|1", built_year=2023, source="quintoandar")
+    reg.learn("k|1", built_year=1977, source="claude", year_confidence="high")
+    info = reg.lookup("k|1")
+    assert (info.built_year, info.year_source) == (1977, "claude")
+
+
+def test_clear_source_drops_only_that_tier(reg):
+    reg.learn("a|1", built_year=2023, source="search", year_confidence="medium")
+    reg.learn("b|1", built_year=1975, source="search", year_confidence="high")
+    reg.learn("c|1", built_year=1988, source="quintoandar")
+    assert reg.clear_source("search", max_confidence="medium") == 1
+    assert reg.lookup("a|1").built_year is None
+    assert reg.lookup("a|1").searched_at == ""
+    assert reg.lookup("b|1").built_year == 1975
+    assert reg.lookup("c|1").built_year == 1988
+
+
+def test_a_year_of_unknown_provenance_is_only_an_estimate(isolated_registry):
+    lst = _mk(condo_key="k|1", built_year=1999, condo_source="search")
+    condos.resolve_condo(lst)
+    assert lst.condo_confidence == "estimated"
+
+
+def test_a_blocked_building_never_gets_a_year(tmp_path, monkeypatch):
+    """A human 'I could not confirm this' has to outrank any resolver."""
+    ov = tmp_path / "condo_overrides.csv"
+    ov.write_text(
+        "key,name,built_year,block\nrua humberto i|928,,,1\n", encoding="utf-8"
+    )
+    reg = CondoRegistry(path=tmp_path / "condos.json", overrides=ov)
+    monkeypatch.setattr(condos, "_registry", reg)
+    monkeypatch.setattr(condos.settings, "condo_search_enabled", True)
+    monkeypatch.setattr(condos.settings, "condo_search_provider", "claude")
+    condos.reset_run_budget()
+
+    calls = []
+    monkeypatch.setattr(
+        "rental_finder.condo_agent.lookup_condo", lambda **kw: calls.append(kw)
+    )
+    lst = _mk(condo_key="rua humberto i|928")
+    condos.resolve_condo(lst)
+    assert calls == []  # not even looked up
+    assert lst.built_year is None
+    assert lst.condo_confidence == "not_found"
+    assert reg.needs_search("rua humberto i|928") is False
+
+
+def test_blocking_clears_a_year_already_stored(tmp_path):
+    ov = tmp_path / "condo_overrides.csv"
+    ov.write_text("key,name,built_year,block\nk|1,,,1\n", encoding="utf-8")
+    cache = tmp_path / "condos.json"
+    reg = CondoRegistry(path=cache, overrides=tmp_path / "none.csv")
+    reg.learn("k|1", built_year=1978, source="claude", year_confidence="medium")
+    reg2 = CondoRegistry(path=cache, overrides=ov)
+    assert reg2.lookup("k|1").built_year is None
+    assert reg2.lookup("k|1").blocked is True
+
+
+def test_a_sibling_listing_waits_and_takes_the_answer(agent_registry, monkeypatch):
+    """Ciomara has four rows in the base; the other three must not come back blank."""
+    import threading
+
+    started = threading.Event()
+
+    def _slow(**kw):
+        started.set()
+        import time
+
+        time.sleep(0.3)
+        return _finding(built_year=1975, confidence="high", found_number="446")
+
+    monkeypatch.setattr("rental_finder.condo_agent.lookup_condo", _slow)
+    key = "rua eca de queiroz|446"
+    winner = _mk(condo_key=key)
+    sibling = _mk(condo_key=key, external_id="2")
+
+    t = threading.Thread(target=condos.resolve_condo, args=(winner,))
+    t.start()
+    started.wait(2)
+    condos.resolve_condo(sibling)
+    t.join(5)
+
+    assert winner.built_year == 1975
+    assert sibling.built_year == 1975
+    assert sibling.condo_confidence == "high"
+
+
+def test_a_sibling_of_an_unresolved_building_is_marked_not_found(
+    agent_registry, monkeypatch
+):
+    monkeypatch.setattr(
+        "rental_finder.condo_agent.lookup_condo",
+        lambda **kw: _finding(confidence="not_found"),
+    )
+    key = "rua alvorada|859"
+    agent_registry.claim_search(key)          # someone else holds it
+    agent_registry.release_search(key)        # ...and finished with nothing
+    lst = _mk(condo_key=key)
+    condos.resolve_condo(lst)
+    assert lst.built_year is None
+
+
+def test_clear_source_with_no_ceiling_clears_every_confidence(reg):
+    reg.learn("a|1", built_year=2023, source="search", year_confidence="medium")
+    reg.learn("b|1", built_year=1975, source="search", year_confidence="high")
+    reg.learn("c|1", built_year=1988, source="quintoandar")
+    assert reg.clear_source("search") == 2
+    assert reg.lookup("a|1").built_year is None
+    assert reg.lookup("b|1").built_year is None
+    assert reg.lookup("c|1").built_year == 1988

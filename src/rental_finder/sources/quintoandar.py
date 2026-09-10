@@ -3,13 +3,14 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
+from datetime import date
 from typing import Any, Callable, Iterator
 
 import structlog
 
 from ..config import settings
 from ..http_client import CurlSession
-from ..models import Listing
+from ..models import Listing, parse_source_date
 from .base import Source
 
 log = structlog.get_logger(__name__)
@@ -177,9 +178,11 @@ class QuintoAndarSource(Source):
                 )
         return seen
 
-    def _fetch_detail(self, house_id: str) -> dict[str, Any] | None:
+    def _fetch_detail(
+        self, house_id: str, url: str | None = None
+    ) -> dict[str, Any] | None:
         """Fetch individual listing page for lat/lng and full houseInfo."""
-        url = f"{BASE}/imovel/{house_id}"
+        url = url or f"{BASE}/imovel/{house_id}"
         try:
             r = self.http.get(url, headers={"Accept": "text/html"})
         except Exception as e:
@@ -208,7 +211,7 @@ class QuintoAndarSource(Source):
         return Listing(
             source=self.name,
             external_id=hid,
-            url=f"{BASE}/imovel/{hid}",
+            url=self._rent_detail_url(hid, self._is_classified(raw)),
             neighborhood=neighborhood,
             price_rent=rent,
             price_total=total,
@@ -217,6 +220,10 @@ class QuintoAndarSource(Source):
             suites=0,
             parking=int(raw.get("parkingSpots") or 0),
             sqm=float(raw.get("area") or 0),
+            # QuintoAndar serves exactly one area field and never says what it
+            # measures. Probed live on 125652767: `area` was 141, the unit is
+            # ~119 m2 and the rest is its two parking spaces.
+            sqm_basis="unspecified",
             pets="aceita pets" in amenities or "pets_allowed" in amenities,
             furnished=bool(raw.get("isFurnished")),
             lat=None,
@@ -238,8 +245,86 @@ class QuintoAndarSource(Source):
         for nb in neighborhoods:
             yield from self._fetch_rent_nb_listings(nb)
 
+    # The detail payload dates the ad in two places: houseInfo.listings[] holds
+    # one entry per business context (RENT / SALE) with its own publication
+    # dates, and houseInfo.lastPublishedDate is the whole-property fallback.
+    # lastPublicationDate — not firstPublicationDate — is what "available since"
+    # means: a 2016 property relisted last month has been on the market a month.
+    _BUSINESS_CONTEXT = {"rent": "RENT", "buy": "SALE"}
+    _PUBLISHED_STATUS = "publicado"
+    _LISTED_AT_KEYS = (
+        "lastPublishedDate",
+        "createdAt",
+        "publishedAt",
+        "publicationDate",
+        "activationDate",
+        "listedAt",
+    )
+
+    def _listed_at_from(self, hi: dict[str, Any] | None, mode: str) -> date | None:
+        hi = hi or {}
+        want = self._BUSINESS_CONTEXT.get(mode, "RENT")
+        for entry in hi.get("listings") or []:
+            if entry.get("businessContext") != want:
+                continue
+            if (entry.get("status") or "").lower() != self._PUBLISHED_STATUS:
+                continue
+            d = parse_source_date(entry.get("lastPublicationDate")) or parse_source_date(
+                entry.get("firstPublicationDate")
+            )
+            if d:
+                return d
+        for key in self._LISTED_AT_KEYS:
+            d = parse_source_date(hi.get(key))
+            if d:
+                return d
+        return None
+
+    def _apply_listed_at(self, lst: Listing, hi: dict[str, Any] | None) -> None:
+        d = self._listed_at_from(hi, lst.mode)
+        if d:
+            lst.listed_at = d
+
+    def _listed_at_urls(self, external_id: str, url: str, kind: str) -> list[str]:
+        """The stored URL first, then its own/classified counterpart.
+
+        Rows written before classifieds were routed correctly point at the
+        unhydrated /imovel shell, which carries no dates — the counterpart does.
+        """
+        if kind == "buy":
+            candidates = [
+                url,
+                self._buy_detail_url(external_id, classified=False),
+                self._buy_detail_url(external_id, classified=True),
+            ]
+        else:
+            candidates = [
+                url,
+                self._rent_detail_url(external_id, classified=False),
+                self._rent_detail_url(external_id, classified=True),
+            ]
+        out: list[str] = []
+        for c in candidates:
+            if c and c not in out:
+                out.append(c)
+        return out[:2]  # one retry only; a dead ad has no date on any route
+
+    def fetch_listed_at(
+        self, *, external_id: str, url: str, kind: str
+    ) -> date | None:
+        for candidate in self._listed_at_urls(external_id, url, kind):
+            detail = (
+                self._fetch_buy_detail(external_id, candidate)
+                if kind == "buy"
+                else self._fetch_detail(external_id, candidate)
+            )
+            d = self._listed_at_from((detail or {}).get("houseInfo"), kind)
+            if d:
+                return d
+        return None
+
     def _enrich_rent(self, lst: Listing) -> None:
-        detail = self._fetch_detail(lst.external_id)
+        detail = self._fetch_detail(lst.external_id, lst.url)
         if not detail:
             return
         markers = detail.get("markers") or {}
@@ -259,6 +344,7 @@ class QuintoAndarSource(Source):
             lst.furnished = bool(hi["hasFurniture"])
         if hi.get("type"):
             lst.property_type = hi["type"]
+        self._apply_listed_at(lst, hi)
 
     def _buy_property_type_slugs(self) -> list[str]:
         type_str = settings.buy_property_types.strip()
@@ -434,6 +520,10 @@ class QuintoAndarSource(Source):
         route = "classificado" if classified else "imovel"
         return f"{BASE}/{route}/{hid}/comprar"
 
+    def _rent_detail_url(self, hid: str, classified: bool) -> str:
+        """Partner classifieds serve an unhydrated shell on /imovel/<id>."""
+        return f"{BASE}/classificado/{hid}/alugar" if classified else f"{BASE}/imovel/{hid}"
+
     def _parse_buy_search_hit(
         self, hid: str, raw: dict[str, Any], nb: str
     ) -> Listing | None:
@@ -463,6 +553,10 @@ class QuintoAndarSource(Source):
             suites=0,
             parking=int(raw.get("parkingSpots") or 0),
             sqm=float(raw.get("area") or 0),
+            # QuintoAndar serves exactly one area field and never says what it
+            # measures. Probed live on 125652767: `area` was 141, the unit is
+            # ~119 m2 and the rest is its two parking spaces.
+            sqm_basis="unspecified",
             pets=False,
             furnished=bool(raw.get("isFurnished")),
             property_type=str(raw.get("type") or ""),
@@ -575,6 +669,7 @@ class QuintoAndarSource(Source):
             lst.pets = bool(hi["acceptsPets"])
         if hi.get("hasFurniture") is not None:
             lst.furnished = bool(hi["hasFurniture"])
+        self._apply_listed_at(lst, hi)
         if settings.condo_enrich_enabled:
             self._apply_condo(lst, hi)
 
@@ -589,7 +684,7 @@ class QuintoAndarSource(Source):
         detail = (
             self._fetch_buy_detail(external_id, url)
             if kind == "buy"
-            else self._fetch_detail(external_id)
+            else self._fetch_detail(external_id, url)
         )
         if not detail:
             return (False, None)

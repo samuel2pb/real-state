@@ -15,20 +15,47 @@ from .models import Listing
 log = structlog.get_logger(__name__)
 
 
+# Notion allows ~3 requests/second per integration, averaged. The pipeline
+# writes from a 10-thread pool, so without a pacer a backfill of a few hundred
+# rows spends its whole retry budget on 429s and still drops ~10 rows per pass.
+_PACE_LOCK = threading.Lock()
+_last_call = 0.0
+
+
+def _pace() -> None:
+    global _last_call
+    gap = 1.0 / max(settings.notion_max_rps, 0.1)
+    with _PACE_LOCK:
+        wait = _last_call + gap - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        _last_call = time.monotonic()
+
+
 def _retry(fn, *a, **kw):
     base = settings.http_backoff_base_sec
+    last = 0
     for attempt in range(1, settings.http_max_retries + 1):
         try:
+            _pace()
             return fn(*a, **kw)
         except APIResponseError as e:
             status = getattr(e, "status", 0)
             if status == 429 or 500 <= status < 600:
-                wait = base * (2 ** (attempt - 1))
+                last = status
+                # Honour Retry-After when Notion sends one; it knows better than
+                # our doubling does.
+                hdrs = getattr(getattr(e, "response", None), "headers", None) or {}
+                try:
+                    wait = float(hdrs.get("Retry-After") or 0)
+                except (TypeError, ValueError):
+                    wait = 0.0
+                wait = wait or base * (2 ** (attempt - 1))
                 log.warning("notion_backoff", status=status, wait=wait, attempt=attempt)
                 time.sleep(wait)
                 continue
             raise
-    raise RuntimeError("notion_retry_exhausted")
+    raise RuntimeError(f"notion_retry_exhausted status={last}")
 
 
 def _stored_price(page: dict, kind: str) -> float | None:
@@ -79,12 +106,28 @@ class NotionStore:
         "PriceDrop": {"number": {"format": "real"}},
         "PriceDropPct": {"number": {"format": "percent"}},
         "PriceChangedAt": {"date": {}},
+        "ListedAt": {"date": {}},
         "CondoName": {"rich_text": {}},
         "CondoKey": {"rich_text": {}},
         "BuiltYear": {"number": {"format": "number"}},
         "CondoAge": {"number": {"format": "number"}},
         "CondoSource": {"select": {}},
+        "CondoConfidence": {"select": {}},
+        "SqmTotal": {"number": {"format": "number"}},
+        "SqmBasis": {"select": {}},
     }
+
+    # Days on the market, counted from the ad's own publication date (ListedAt)
+    # and only falling back to FirstSeen — when we first saw it — for sources
+    # that publish no date. End is LastSeen so a gone listing freezes instead of
+    # counting forever.
+    AVAILABILITY_DAYS_FORMULA = """lets(
+  start, if(empty(prop("ListedAt")), prop("FirstSeen"), prop("ListedAt")),
+  finish, if(empty(prop("LastSeen")), now(), prop("LastSeen")),
+  if(empty(start), 0, dateBetween(finish, start, "days"))
+)"""
+
+    _FORMULA_SPEC = {"AvailabilityDays": AVAILABILITY_DAYS_FORMULA}
 
     # list_alive filters on every one of these, and Notion 400s a query that
     # names a select option the property does not have.
@@ -107,6 +150,7 @@ class NotionStore:
                 )
                 log.info("notion_col_added", kind=kind, col=col)
         self._ensure_status_options(ds_id, existing, kind)
+        self._ensure_formulas(ds_id, existing, kind)
         with self._lock:
             self._schema_ensured.add(ds_id)
 
@@ -129,6 +173,26 @@ class NotionStore:
             properties={"Status": {"select": {"options": merged}}},
         )
         log.info("notion_status_options_added", kind=kind, added=missing)
+
+    def _ensure_formulas(self, ds_id: str, existing: dict, kind: str) -> None:
+        """Create or re-sync the formula columns this code owns."""
+        for name, expression in self._FORMULA_SPEC.items():
+            current = ((existing.get(name) or {}).get("formula") or {}).get(
+                "expression"
+            )
+            if current == expression:
+                continue
+            _retry(
+                self.client.data_sources.update,
+                data_source_id=ds_id,
+                properties={name: {"formula": {"expression": expression}}},
+            )
+            log.info(
+                "notion_formula_synced",
+                kind=kind,
+                col=name,
+                created=current is None,
+            )
 
     def _find_page(self, kind: str, external_id: str, source: str) -> dict | None:
         ds_id = self._data_source_id(kind)
@@ -172,6 +236,7 @@ class NotionStore:
                 "Suites": {"number": lst.suites},
                 "Parking": {"number": lst.parking},
                 "Sqm": {"number": lst.sqm},
+                **_area_props(lst),
                 "Pets": {"checkbox": lst.pets},
                 "PropertyType": {"select": {"name": lst.property_type}}
                 if lst.property_type
@@ -180,6 +245,7 @@ class NotionStore:
                     "rich_text": [{"text": {"content": (lst.address or "")[:1800]}}]
                 },
                 "LastSeen": {"date": {"start": lst.last_seen.isoformat()}},
+                **_listed_at_props(lst),
                 **_condo_props(lst),
             }
             if lst.distance_km is not None:
@@ -204,6 +270,7 @@ class NotionStore:
             "Suites": {"number": lst.suites},
             "Parking": {"number": lst.parking},
             "Sqm": {"number": lst.sqm},
+            **_area_props(lst),
             "Pets": {"checkbox": lst.pets},
             "PropertyType": {"select": {"name": lst.property_type}}
             if lst.property_type
@@ -212,6 +279,7 @@ class NotionStore:
                 "rich_text": [{"text": {"content": (lst.address or "")[:1800]}}]
             },
             "LastSeen": {"date": {"start": lst.last_seen.isoformat()}},
+            **_listed_at_props(lst),
         }
         if lst.distance_km is not None:
             props["DistanceKm"] = {"number": round(lst.distance_km, 2)}
@@ -339,6 +407,14 @@ class NotionStore:
             props["PriceChangedAt"] = {"date": {"start": date.today().isoformat()}}
         _retry(self.client.pages.update, page_id=page_id, properties=props)
 
+    def update_listed_at(self, page_id: str, listed_at: date) -> None:
+        """Patch only ListedAt on an existing page (backfill path)."""
+        _retry(
+            self.client.pages.update,
+            page_id=page_id,
+            properties={"ListedAt": {"date": {"start": listed_at.isoformat()}}},
+        )
+
     def update_condo(self, page_id: str, lst: Listing) -> None:
         """Patch only the condo columns on an existing page (backfill path)."""
         props = self._strip_missing(_condo_props(lst))
@@ -383,6 +459,20 @@ class NotionStore:
                     "condo_key": _plain(p.get("CondoKey")),
                     "condo_name": _plain(p.get("CondoName")),
                     "built_year": (p.get("BuiltYear") or {}).get("number"),
+                    "condo_confidence": (
+                        (p.get("CondoConfidence") or {}).get("select") or {}
+                    ).get("name", ""),
+                    "listed_at": ((p.get("ListedAt") or {}).get("date") or {}).get(
+                        "start"
+                    ),
+                    # Enough of the unit to tell two condos on one street apart
+                    # when the listing carries no building name.
+                    "sqm": (p.get("Sqm") or {}).get("number") or 0,
+                    "condo_fee": (p.get("CondoFee") or {}).get("number") or 0,
+                    "bedrooms": (p.get("Bedrooms") or {}).get("number") or 0,
+                    "suites": (p.get("Suites") or {}).get("number") or 0,
+                    "parking": (p.get("Parking") or {}).get("number") or 0,
+                    "address": _plain(p.get("Address")),
                 }
             if not r.get("has_more"):
                 break
@@ -393,6 +483,29 @@ class NotionStore:
 
     def list_gone(self, kind: str = "rent") -> Iterator[dict]:
         yield from self._list_by_status(kind, ["gone"])
+
+
+def _listed_at_props(lst: Listing) -> dict:
+    """ListedAt only when the source told us. Absent means 'leave the cell alone'."""
+    if not lst.listed_at:
+        return {}
+    return {"ListedAt": {"date": {"start": lst.listed_at.isoformat()}}}
+
+
+def _area_props(lst: Listing) -> dict:
+    """What `Sqm` actually measures, and the total when the source splits them.
+
+    Zap publishes usableAreas and totalAreas; QuintoAndar publishes one
+    unlabelled `area`, so its rows say "unspecified" rather than pretending the
+    number is private area. Any R$/m2 built on an "unspecified" row is a floor,
+    not a value: a total-area number understates the real price per square metre.
+    """
+    return {
+        "SqmTotal": {"number": lst.sqm_total or None},
+        "SqmBasis": {"select": {"name": lst.sqm_basis}}
+        if lst.sqm_basis
+        else {"select": None},
+    }
 
 
 def _condo_props(lst: Listing) -> dict:
@@ -412,6 +525,11 @@ def _condo_props(lst: Listing) -> dict:
         "CondoAge": {"number": lst.condo_age_years},
         "CondoSource": {"select": {"name": lst.condo_source}}
         if lst.condo_source
+        else {"select": None},
+        # Written on every enriched row, including misses ("not_found"), so a
+        # Ranking formula can require high/medium before it trusts CondoAge.
+        "CondoConfidence": {"select": {"name": lst.condo_confidence}}
+        if lst.condo_confidence
         else {"select": None},
     }
 

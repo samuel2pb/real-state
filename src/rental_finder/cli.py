@@ -54,18 +54,53 @@ def recheck_gone_cmd(
         typer.echo({"kind": "buy", **stats})
 
 
+@app.command("listed-at-backfill")
+def listed_at_backfill_cmd(
+    kind: str = typer.Option("both", help="'rent', 'buy', or 'both'"),
+    include_gone: bool = typer.Option(
+        True, help="Also backfill rows already marked gone"
+    ),
+) -> None:
+    """Fill ListedAt on rows the normal cycle never rewrites (gone / price-*)."""
+    _init_logging()
+    from .pipeline import backfill_listed_at
+
+    for k in ("rent", "buy") if kind == "both" else (kind,):
+        stats = backfill_listed_at(kind=k, include_gone=include_gone)
+        typer.echo({"kind": k, **stats})
+
+
 @app.command("condo-backfill")
 def condo_backfill_cmd(
     kind: str = typer.Option("buy", help="'buy' or 'rent'"),
     max_searches: int = typer.Option(
-        0, help="Cap web searches this run (0 = use CONDO_SEARCH_MAX_PER_RUN)"
+        0, help="Cap lookups this run (0 = use CONDO_SEARCH_MAX_PER_RUN)"
+    ),
+    neighborhoods: str = typer.Option(
+        "", help="Comma-separated bairros; empty = every bairro in the base"
+    ),
+    bedrooms_min: int = typer.Option(0, help="Skip rows below this bedroom count"),
+    only_missing: bool = typer.Option(
+        False, help="Skip rows that already carry a BuiltYear"
+    ),
+    refresh: bool = typer.Option(
+        False,
+        help="Ignore the BuiltYear already on the row and resolve it again. "
+        "Use after condo-invalidate, or the retired value is just re-stamped.",
     ),
 ) -> None:
-    """Fill CondoName/BuiltYear/CondoAge on existing Notion rows."""
+    """Fill CondoName/BuiltYear/CondoAge/CondoConfidence on existing Notion rows."""
     _init_logging()
     from .pipeline import backfill_condos
 
-    stats = backfill_condos(kind=kind, max_searches=max_searches or None)
+    stats = backfill_condos(
+        kind=kind,
+        max_searches=max_searches or None,
+        neighborhoods=[n for n in neighborhoods.split(",") if n.strip()],
+        bedrooms_min=bedrooms_min,
+        only_missing=only_missing,
+        refresh=refresh,
+    )
     typer.echo({"kind": kind, **stats})
 
 
@@ -111,7 +146,7 @@ def condo_search_cmd(
     number: str = typer.Argument(..., help="Street number, e.g. '222'"),
     neighborhood: str = typer.Option("", help="Neighborhood, sharpens the query"),
 ) -> None:
-    """One-shot debug of the year search: query, results, extraction."""
+    """One-shot debug of the legacy SERP-snippet year search."""
     _init_logging()
     from .condo_search import build_query, search_year
 
@@ -120,6 +155,146 @@ def condo_search_cmd(
         name=name, street=street, number=number, neighborhood=neighborhood
     )
     typer.echo(hit if hit else "no year found")
+
+
+@app.command("condo-lookup")
+def condo_lookup_cmd(
+    street: str = typer.Argument(..., help="Street, e.g. 'Rua Jose Antonio Coelho'"),
+    number: str = typer.Argument(..., help="Street number, e.g. '603'"),
+    name: str = typer.Option("", help="Building name, when the listing has one"),
+    neighborhood: str = typer.Option("", help="Neighborhood, sharpens the search"),
+    sqm: float = typer.Option(0, help="Unit size, helps identify an unnamed building"),
+    condo_fee: float = typer.Option(0, help="Monthly condo fee, same purpose"),
+    bedrooms: int = typer.Option(0),
+    suites: int = typer.Option(0),
+    parking: int = typer.Option(0),
+    show_prompt: bool = typer.Option(False, help="Print the prompt and exit"),
+) -> None:
+    """One-shot debug of the `claude -p` resolver for a single building."""
+    _init_logging()
+    from .condo_agent import build_prompt, lookup_condo
+
+    hints = {
+        "sqm": sqm,
+        "condo_fee": condo_fee,
+        "bedrooms": bedrooms,
+        "suites": suites,
+        "parking": parking,
+    }
+    if show_prompt:
+        typer.echo(
+            build_prompt(
+                name=name,
+                street=street,
+                number=number,
+                neighborhood=neighborhood,
+                hints=hints,
+            )
+        )
+        return
+    finding = lookup_condo(
+        name=name,
+        street=street,
+        number=number,
+        neighborhood=neighborhood,
+        hints=hints,
+    )
+    typer.echo(finding if finding else "resolver unreachable")
+
+
+@app.command("condo-invalidate")
+def condo_invalidate_cmd(
+    source: str = typer.Option("search", help="Year source to drop: search|claude|quintoandar"),
+    max_confidence: str = typer.Option(
+        "", help="Only drop values at or below this confidence (e.g. 'medium')"
+    ),
+    yes: bool = typer.Option(False, "--yes", help="Skip the confirmation prompt"),
+) -> None:
+    """Forget years that came from one source, so they are resolved again.
+
+    The SERP tier scored 328 years as 'medium' with the same rule that recorded
+    a 1977 building as 2023 off a neighbourhood index page. None of them were
+    checked against the address they came from, so they are all suspect.
+    """
+    _init_logging()
+    from .condos import registry
+
+    reg = registry()
+    if not yes:
+        typer.confirm(
+            f"Drop every year with source={source!r}"
+            + (f" and confidence <= {max_confidence!r}" if max_confidence else "")
+            + "? They will be resolved again on the next run.",
+            abort=True,
+        )
+    typer.echo({"cleared": reg.clear_source(source, max_confidence=max_confidence)})
+
+
+@app.command("condo-golden")
+def condo_golden_cmd(
+    path: str = typer.Option(
+        "tests/fixtures/condo_golden.csv", help="CSV of key,name,built_year"
+    ),
+    use_cache: bool = typer.Option(
+        False, help="Answer from the registry instead of calling the resolver"
+    ),
+) -> None:
+    """Run the resolver over the hand-verified buildings and diff the years.
+
+    The expected rows are the ones checked by hand in the 2026-09-05 handoff.
+    Rows with an empty built_year are negative cases: the resolver must return
+    no year for them, because no public source states one.
+    """
+    _init_logging()
+    import csv as _csv
+
+    from .condo_agent import lookup_condo
+    from .condos import registry, split_key
+
+    reg = registry()
+    rows = list(_csv.DictReader(open(path, encoding="utf-8")))
+    ok = bad = 0
+    for row in rows:
+        key = (row.get("key") or "").strip()
+        want = (row.get("built_year") or "").strip()
+        street, number = split_key(key)
+        info = reg.lookup(key)
+        if info is not None and info.blocked:
+            # An override says no resolver may answer for this building. Report
+            # it rather than skipping it: a silent pass would make the golden set
+            # look green for the wrong reason.
+            got, conf = None, "blocked"
+        elif use_cache:
+            got, conf = (info.built_year if info else None), (
+                info.year_confidence if info else ""
+            )
+        else:
+            finding = lookup_condo(
+                name=(row.get("name") or "").strip(),
+                street=street,
+                number=number,
+                neighborhood=(row.get("neighborhood") or "").strip(),
+                # The same unit facts the pipeline sends. Without them the run
+                # cannot reproduce a rejection that was made on unit profile —
+                # City Park is the only building at Rua Humberto I 928, and only
+                # its fee and room counts say it is not the one.
+                hints={
+                    k: float(row[k])
+                    for k in ("sqm", "condo_fee", "bedrooms", "suites", "parking")
+                    if (row.get(k) or "").strip()
+                },
+            )
+            got, conf = (
+                (finding.built_year, finding.confidence) if finding else (None, "unreachable")
+            )
+        expected = int(want) if want else None
+        match = got == expected
+        ok, bad = (ok + 1, bad) if match else (ok, bad + 1)
+        typer.echo(
+            f"{'OK ' if match else 'BAD'} {key:<48} want={want or 'null':<6} "
+            f"got={got or 'null':<6} conf={conf}"
+        )
+    typer.echo({"rows": len(rows), "match": ok, "mismatch": bad})
 
 
 @app.command("schedule")

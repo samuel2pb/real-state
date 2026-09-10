@@ -1,0 +1,18 @@
+key,name,neighborhood,built_year,sqm,condo_fee,bedrooms,suites,parking,note
+rua estela|755,Alceste,Vila Mariana,1977,,,,,,
+rua jose antonio coelho|730,Bardauni,Vila Mariana,1973,,,,,,
+rua gandavo|298,Dona America,Vila Mariana,1977,,,,,,
+travessa humberto i|962,Luci e Lea,Vila Mariana,1982,,,,,,identified by fee + size + bedrooms rather than by name
+rua eca de queiroz|258,Carue,Vila Mariana,1975,,,,,,duplicate Loft records disagree: 1974 vs 1975
+rua eca de queiroz|446,Ciomara,Vila Mariana,1975,,,,,,
+rua joinville|637,Alvecon,Vila Mariana,1976,,,,,,
+avenida rouxinol|438,Indaia,Moema,1982,,,,,,
+avenida rouxinol|780,Ponte Di Rialto,Moema,1976,,,,,,
+rua gaivota|647,Cruzeiro do Sul,Moema,1979,,,,,,
+avenida jandira|647,Taquari,Indianopolis,1983,,,,,,duplicate Loft records disagree: 1983 vs 1985
+alameda joaquim eugenio de lima|70,Cleveland,Jardim Paulista,1996,,,,,,duplicate Loft records disagree: 1996 vs 1997
+avenida brigadeiro luis antonio|2819,Edificios Residence e E. Calfat,Jardim Paulista,1970,,,,,,
+rua jose antonio coelho|603,Villa Di Trevi / Villa Castella,Vila Mariana,1977,,,,,,the SERP tier recorded 2023 here
+rua jose antonio coelho|750,Edificio Nilo,Vila Mariana,,,,,,,negative case: address confirmed but no public source states the year
+rua humberto i|928,,Vila Mariana,,90,1300,3,2,2,negative case: City Park is the only building at 928 but its unit profile does not fit
+avenida chibaras|381,,Moema,,108,,,,,negative case: the Edificio Chibaras found by search is at 415 not 381

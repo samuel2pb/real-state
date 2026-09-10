@@ -71,11 +71,25 @@ class Settings(BaseSettings):
     condo_cache_file: str = "condos.json"
     condo_overrides_file: str = "condo_overrides.csv"
     condo_search_enabled: bool = True
-    condo_search_provider: Literal["serper", "brave", "google_cse"] = "serper"
+    # "claude" runs `claude -p` with WebSearch/WebFetch and reads the ficha
+    # técnica itself. The three SERP providers are the old snippet tier, kept
+    # only as a fallback: they wrote a 1977 building down as 2023 off a
+    # neighbourhood index page, and that row then topped the ranking.
+    condo_search_provider: Literal["claude", "serper", "brave", "google_cse"] = "claude"
     condo_search_api_key: str = ""
     condo_search_cse_id: str = ""      # google_cse only
     condo_search_max_per_run: int = 50
-    condo_search_min_confidence: Literal["medium", "high"] = "medium"
+    condo_search_min_confidence: Literal["estimated", "medium", "high"] = "medium"
+
+    # `claude -p` tier
+    condo_agent_cmd: str = "claude"           # resolved via PATH
+    condo_agent_model: str = "sonnet"
+    condo_agent_timeout_sec: int = 420
+    # Per building, handed to `claude --max-budget-usd`. Measured ~$0.50 on a
+    # building that needed two sources; a cap at 0.60 killed the run before it
+    # could answer.
+    condo_agent_max_usd: float = 1.20
+    condo_agent_concurrency: int = 2          # parallel `claude -p` subprocesses
     # A building the search already failed on is parked for good: the year is
     # simply not in any snippet, and re-querying it burns credits every run.
     # Flip this on (or run `condo-retry-misses`) after improving the extractor.
@@ -97,6 +111,11 @@ class Settings(BaseSettings):
     http_backoff_base_sec: float = 1.0
     http_playwright_fallback: bool = True
     http_user_agents: str = ""
+
+    # Notion's documented average is ~3 requests/second per integration. Writes
+    # come off a 10-thread pool, so this is paced centrally rather than by
+    # shrinking every pool.
+    notion_max_rps: float = 2.5
 
     geocoder_user_agent: str = "real-estate-scraper/0.1"
     geocoder_rate_limit_sec: float = 1.0

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from datetime import date
 from typing import Callable, Iterator
 
 from ..models import Listing
@@ -20,6 +21,15 @@ class Source(ABC):
 
     def enrich(self, lst: Listing) -> None:
         """Mutate listing with per-detail data (e.g. lat/lng, condo). Default no-op."""
+        return None
+
+    def fetch_listed_at(
+        self, *, external_id: str, url: str, kind: str
+    ) -> date | None:
+        """Publication date of an already-stored listing, for backfill.
+
+        Default: unknown. Sources that expose a date implement this.
+        """
         return None
 
     def search_tasks(

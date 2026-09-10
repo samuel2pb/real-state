@@ -1,0 +1,17 @@
+key,name,built_year,block,why
+rua estela|755,Alceste,1977,,handoff 2026-09-05 hand check; agent confirmed 1977 high
+rua jose antonio coelho|730,Bardauni,1973,,handoff hand check; agent confirmed 1973 high
+rua gandavo|298,Dona America,1977,,handoff hand check; agent confirmed 1977
+travessa humberto i|962,Luci e Lea,1982,,handoff hand check; agent confirmed 1982 (duplicate Loft record says 1971)
+rua eca de queiroz|258,Carue,1975,,"handoff hand check; agent saw 1974 and 1975, oldest-year rule would pick 1974"
+rua eca de queiroz|446,Ciomara,1975,,handoff hand check; agent confirmed 1975 high
+rua joinville|637,Alvecon,1976,,handoff hand check; agent confirmed 1976 high
+avenida rouxinol|438,Indaia,1982,,handoff hand check; agent confirmed 1982 high
+avenida rouxinol|780,Ponte Di Rialto,1976,,handoff hand check; agent confirmed 1976 high
+rua gaivota|647,Cruzeiro do Sul,1979,,handoff hand check; agent confirmed 1979 high
+avenida jandira|647,Taquari,1983,,"handoff hand check; agent saw 1983 and 1985, oldest-year rule picks 1983"
+alameda joaquim eugenio de lima|70,Cleveland,1996,,"handoff hand check; agent saw 1996 and 1997, oldest-year rule picks 1996"
+avenida brigadeiro luis antonio|2819,Edificios Residence e E. Calfat,1970,,handoff hand check; agent confirmed 1970 high
+rua jose antonio coelho|603,Villa Di Trevi / Villa Castella,1977,,THE 2023 BUG. Handoff hand check + agent confirmed 1977 twice (Lopes + Loft)
+rua jose antonio coelho|750,Edificio Nilo,,1,"address confirmed, no public source states the year. Agent answers 1986 from a single Loft ficha whose URL carries no slug; unblock if that page is verified"
+rua humberto i|928,,,1,"City Park (1978) is the only building at 928 but its unit profile does not fit (90 m2, 2 suites). Agent answers 1978 single-source; unblock if reconciled"

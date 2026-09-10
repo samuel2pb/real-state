@@ -7,7 +7,7 @@ import structlog
 
 from ..config import settings
 from ..http_client import CurlSession
-from ..models import Listing
+from ..models import Listing, parse_source_date
 from .base import Source
 
 log = structlog.get_logger(__name__)
@@ -263,6 +263,8 @@ class ZapSource(Source):
             suites=int((node.get("suites") or [0])[0] or 0),
             parking=int((node.get("parkingSpaces") or [0])[0] or 0),
             sqm=float((node.get("usableAreas") or [0])[0] or 0),
+            sqm_total=float((node.get("totalAreas") or [0])[0] or 0),
+            sqm_basis="usable",
             pets=pets,
             furnished=furnished,
             property_type=prop_type,
@@ -274,6 +276,7 @@ class ZapSource(Source):
                     [addr.get("street"), addr.get("neighborhood"), addr.get("city")],
                 )
             ),
+            listed_at=parse_source_date(node.get("createdAt")),
         )
 
     def _parse_buy_one(
@@ -325,6 +328,8 @@ class ZapSource(Source):
             suites=int((node.get("suites") or [0])[0] or 0),
             parking=int((node.get("parkingSpaces") or [0])[0] or 0),
             sqm=float((node.get("usableAreas") or [0])[0] or 0),
+            sqm_total=float((node.get("totalAreas") or [0])[0] or 0),
+            sqm_basis="usable",
             pets=pets,
             furnished=furnished,
             property_type=prop_type,
@@ -336,6 +341,7 @@ class ZapSource(Source):
                     [addr.get("street"), addr.get("neighborhood"), addr.get("city")],
                 )
             ),
+            listed_at=parse_source_date(node.get("createdAt")),
         )
 
     def _fetch_rent_nb(self, nb: str, size: int = 60) -> list[Listing]:

@@ -7,6 +7,13 @@ import pytest
 from rental_finder import condo_search
 from rental_finder.condo_search import _score, build_query, extract_year
 
+
+@pytest.fixture(autouse=True)
+def _serper_provider(monkeypatch):
+    """These tests cover the legacy SERP tier; the default provider is now claude."""
+    monkeypatch.setattr(condo_search.settings, "condo_search_provider", "serper")
+
+
 YEAR = date.today().year
 
 

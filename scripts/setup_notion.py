@@ -16,6 +16,7 @@ import typer
 from notion_client import Client
 
 from rental_finder.config import settings
+from rental_finder.notion_store import NotionStore
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -87,6 +88,10 @@ def _schema(kind: str = "rent") -> dict:
         "PriceDrop": {"number": {"format": "real"}},
         "PriceDropPct": {"number": {"format": "percent"}},
         "PriceChangedAt": {"date": {}},
+        "ListedAt": {"date": {}},
+        "AvailabilityDays": {
+            "formula": {"expression": NotionStore.AVAILABILITY_DAYS_FORMULA}
+        },
     }
     if kind == "buy":
         shared["Price"] = {"number": {"format": "real"}}

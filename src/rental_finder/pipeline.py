@@ -89,12 +89,6 @@ def _process_listing(
 ) -> bool:
     """Enrich + filter + upsert one listing. Returns True if upserted."""
     src.enrich(lst)
-    if settings.condo_enrich_enabled and kind == "buy" and is_apartment(lst):
-        # display/analytics only — never allowed to drop a listing
-        try:
-            resolve_condo(lst)
-        except Exception as e:
-            log.warning("condo_resolve_err", id=lst.global_id, err=str(e)[:200])
     _annotate_distance(lst, work)
     if (
         lst.distance_km is not None
@@ -105,6 +99,14 @@ def _process_listing(
         return False
     if not matches(lst):
         return False
+    # Only after the listing has earned its Notion row: a condo lookup is an
+    # agent run, and spending one on a listing the filters then drop buys
+    # nothing. Display/analytics only — never allowed to drop a listing.
+    if settings.condo_enrich_enabled and kind == "buy" and is_apartment(lst):
+        try:
+            resolve_condo(lst)
+        except Exception as e:
+            log.warning("condo_resolve_err", id=lst.global_id, err=str(e)[:200])
     lst.last_seen = today
     lst.first_seen = today
     store.upsert_listing(lst, kind=kind)
@@ -292,27 +294,50 @@ def run_buy_cycle() -> dict:
     return stats
 
 
-def backfill_condos(kind: str = "buy", max_searches: int | None = None) -> dict:
+def backfill_condos(
+    kind: str = "buy",
+    max_searches: int | None = None,
+    neighborhoods: list[str] | None = None,
+    bedrooms_min: int = 0,
+    only_missing: bool = False,
+    refresh: bool = False,
+) -> dict:
     """Fill condo columns on existing Notion rows.
 
     Rows written before the CondoKey column existed have no key and are skipped;
     they self-heal on the next cycle. Not called from the run cycles.
+
+    `neighborhoods` / `bedrooms_min` / `only_missing` narrow the sweep. Resolving
+    every building in the base is ~7 hours of agent time, while the shortlist
+    that actually gets read is a few dozen rows — do that one first and measure.
     """
+    wanted = {n.strip().lower() for n in (neighborhoods or []) if n.strip()}
     if max_searches is not None:
         settings.condo_search_max_per_run = max_searches
     store = NotionStore()
     store.ensure_columns(kind)
     reset_run_budget()
+    from .condo_agent import reset_rate_limit
+
+    # The account's limit resets on its own clock; a new run gets a fresh try.
+    reset_rate_limit()
     stats = {"examined": 0, "skipped": 0, "named": 0, "dated": 0, "updated": 0}
     stats_lock = threading.Lock()
 
     def _job(row: dict) -> None:
         with stats_lock:
             stats["examined"] += 1
-        if not row.get("condo_key"):
+        if (
+            not row.get("condo_key")
+            or (wanted and (row.get("neighborhood") or "").lower() not in wanted)
+            or (bedrooms_min and int(row.get("bedrooms") or 0) < bedrooms_min)
+            or (only_missing and row.get("built_year"))
+        ):
             with stats_lock:
                 stats["skipped"] += 1
             return
+        # The unit's own numbers ride along: with no building name, they are
+        # what tells two condominiums on the same street apart.
         lst = Listing(
             source=row["source"],
             external_id=row["external_id"],
@@ -320,24 +345,30 @@ def backfill_condos(kind: str = "buy", max_searches: int | None = None) -> dict:
             neighborhood=row.get("neighborhood") or "",
             price_rent=0.0,
             price_total=0.0,
-            bedrooms=0,
+            bedrooms=int(row.get("bedrooms") or 0),
             bathrooms=0,
-            suites=0,
-            parking=0,
-            sqm=0.0,
+            suites=int(row.get("suites") or 0),
+            parking=int(row.get("parking") or 0),
+            sqm=float(row.get("sqm") or 0),
             pets=False,
             furnished=None,
             lat=None,
             lng=None,
             mode=kind,
+            condo_fee=float(row.get("condo_fee") or 0),
             condo_key=row["condo_key"],
             condo_name=row.get("condo_name") or "",
+            condo_confidence=row.get("condo_confidence") or "",
         )
         year = row.get("built_year")
-        if year:
+        # Seeding the stored year makes resolve_condo return early, which is what
+        # we want on a normal pass. After a `condo-invalidate` it is exactly
+        # wrong: the row's year is the value being retired, and seeding it would
+        # simply re-stamp it. `refresh` drops it so the resolver decides again.
+        if year and not refresh:
             lst.apply_built_year(int(year))
         resolve_condo(lst)
-        if not (lst.condo_name or lst.built_year):
+        if not (lst.condo_name or lst.built_year or lst.condo_confidence):
             return
         store.update_condo(row["page_id"], lst)
         with stats_lock:
@@ -355,6 +386,67 @@ def backfill_condos(kind: str = "buy", max_searches: int | None = None) -> dict:
             except Exception as e:
                 log.error("condo_backfill_error", kind=kind, err=str(e))
     stats["registry"] = registry().stats()
+    from .condo_agent import limit_reason, rate_limited
+
+    if rate_limited():
+        # Surface it in the command's own output: a run that stopped resolving
+        # half way through is not the same as a run that found nothing.
+        stats["rate_limited"] = limit_reason()
+    return stats
+
+
+def backfill_listed_at(kind: str = "rent", include_gone: bool = True) -> dict:
+    """Stamp ListedAt on rows the normal cycle never rewrites.
+
+    Only listings that come back in search results get re-upserted, so gone /
+    price-up / price-drop rows keep counting availability from FirstSeen unless
+    they are backfilled here. Rows that already carry a date are skipped.
+    """
+    store = NotionStore()
+    store.ensure_columns(kind)
+    sources = enabled_sources(mode=kind)
+    src_by_name = {s.name: s for s in sources}
+    stats = {"examined": 0, "skipped": 0, "no_source": 0, "no_date": 0, "updated": 0}
+    stats_lock = threading.Lock()
+
+    def _job(row: dict) -> None:
+        with stats_lock:
+            stats["examined"] += 1
+        if row.get("listed_at"):
+            with stats_lock:
+                stats["skipped"] += 1
+            return
+        src = src_by_name.get(row["source"])
+        if src is None:
+            with stats_lock:
+                stats["no_source"] += 1
+            return
+        d = src.fetch_listed_at(
+            external_id=row["external_id"], url=row["url"], kind=kind
+        )
+        if not d:
+            with stats_lock:
+                stats["no_date"] += 1
+            return
+        store.update_listed_at(row["page_id"], d)
+        with stats_lock:
+            stats["updated"] += 1
+        log.info(
+            "listed_at_backfilled",
+            id=f"{row['source']}:{row['external_id']}",
+            listed_at=d.isoformat(),
+        )
+
+    rows = list(store.list_alive(kind=kind))
+    if include_gone:
+        rows += list(store.list_gone(kind=kind))
+    with ThreadPoolExecutor(max_workers=POOL_WORKERS) as pool:
+        futures = [pool.submit(_job, row) for row in rows]
+        for fut in as_completed(futures):
+            try:
+                fut.result()
+            except Exception as e:
+                log.error("listed_at_backfill_error", kind=kind, err=str(e))
     return stats
 
 

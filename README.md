@@ -29,8 +29,10 @@ uv run rental-finder run-once    # one full fetch → filter → upsert cycle
 uv run rental-finder schedule    # start the cron scheduler (blocking)
 
 uv run rental-finder condo-stats                       # what the condo registry knows
-uv run rental-finder condo-backfill --kind buy --max 20  # fill condo cols on existing rows
-uv run rental-finder condo-search Mustique "Rua Arandu" 222  # debug one year lookup
+uv run rental-finder condo-backfill --kind buy --max-searches 20  # fill condo cols on existing rows
+uv run rental-finder condo-lookup "Rua Jose Antonio Coelho" 603 --neighborhood "Vila Mariana"
+uv run rental-finder condo-golden                      # re-resolve the hand-verified buildings
+uv run rental-finder condo-invalidate --source search  # forget the SERP tier's years
 uv run rental-finder condo-retry-misses                # reopen parked buildings
 ```
 
@@ -50,29 +52,68 @@ All params live in `.env`. Key groups:
 | Schedule | `SCHEDULE_CRON_TIMES` (comma-separated cron exprs), `SCHEDULE_TZ` |
 | HTTP | `HTTP_IMPERSONATE`, `HTTP_MIN/MAX_DELAY_SEC`, `HTTP_MAX_RETRIES`, `HTTP_PLAYWRIGHT_FALLBACK` |
 | Sources | `SOURCE_ZAPIMOVEIS_ENABLED`, `SOURCE_QUINTOANDAR_ENABLED` |
-| Condo (buy) | `CONDO_ENRICH_ENABLED`, `CONDO_SEARCH_ENABLED`, `CONDO_SEARCH_PROVIDER`, `CONDO_SEARCH_API_KEY`, `CONDO_SEARCH_MAX_PER_RUN`, `CONDO_SEARCH_MIN_CONFIDENCE` |
+| Condo (buy) | `CONDO_ENRICH_ENABLED`, `CONDO_SEARCH_ENABLED`, `CONDO_SEARCH_PROVIDER`, `CONDO_SEARCH_API_KEY`, `CONDO_SEARCH_MAX_PER_RUN`, `CONDO_SEARCH_MIN_CONFIDENCE`, `CONDO_AGENT_MODEL`, `CONDO_AGENT_MAX_USD`, `CONDO_AGENT_CONCURRENCY` |
 
 See `.env.example` for the full annotated list.
 
 ### Condo name + build year + age (buy, QuintoAndar only)
 
-Apartment rows get `CondoName`, `BuiltYear`, `CondoAge` and `CondoSource` in Notion.
+Apartment rows get `CondoName`, `BuiltYear`, `CondoAge`, `CondoSource` and
+`CondoConfidence` in Notion.
 
 - **Name** comes free from the QuintoAndar detail page — it is already fetched during enrich.
-- **Year** is served by QuintoAndar on only ~10% of listings. The rest is resolved from
-  web-search snippets: one query per *building*, cached forever in `.cache/condos.json`,
-  so the quota cost is a few hundred queries total. Leave `CONDO_SEARCH_API_KEY` blank to
-  keep the search tier off — names still land, years stay sparse.
+- **Year** is served by QuintoAndar on only ~10% of listings. The rest is resolved by
+  `CONDO_SEARCH_PROVIDER=claude`: one `claude -p` run per *building*, with WebSearch and
+  WebFetch, reading the ficha tecnica itself (Loft is the only site that publishes
+  "Construcao" consistently for older zona-sul buildings). Cached forever in
+  `.cache/condos.json`, so the cost is one lookup per building, ever.
+- **Auth.** The agent tier uses the Claude Code login on this machine and needs no API key,
+  but an interactive OAuth session expires and a scheduled run would then resolve nothing.
+  For unattended runs create a long-lived token with `claude setup-token` and export
+  `CLAUDE_CODE_OAUTH_TOKEN` (or set `ANTHROPIC_API_KEY`) in the environment the scheduled
+  task runs under.
+- **Nothing the agent says is taken on trust.** The year must be plausible, and the street
+  number the agent reports having read must equal the number in the `CondoKey` — a real
+  "Edificio Chibaras" built in 1973 exists at Avenida Chibaras 415, and that is not the
+  building at 381. A mismatch, or an answer that names no address at all, is stored as a
+  miss, never as a year.
+- **`CondoConfidence` is written on every enriched row** — `high`, `medium`, `estimated` or
+  `not_found`. Only `medium` and above write `BuiltYear` (`CONDO_SEARCH_MIN_CONFIDENCE`).
+  Any ranking formula in Notion must require `high`/`medium` before it trusts `CondoAge`:
+  the SERP tier's unqualified `medium` years are what put a 1977 building at the top of the
+  base as a 2023 build.
+- The old SERP-snippet tier is still selectable (`serper` / `brave` / `google_cse`) and still
+  needs `CONDO_SEARCH_API_KEY`, but it reads years out of search snippets and cannot tell a
+  ficha tecnica from a neighbourhood index page. `condo-invalidate --source search` drops
+  everything it wrote so the agent resolves those buildings again.
 - Buildings are keyed by normalized street + number, so a name learned from one listing
   fills in every other unit in the same building, including partner classifieds that
-  publish no condominium block of their own.
-- A building is searched **once**. If no year comes back it is parked for good — the
-  year simply is not in any snippet for it, and retrying costs a credit every run.
-  `condo-stats` reports `parked_misses` vs `never_searched`; `condo-retry-misses`
-  reopens the parked ones, which is only worth doing after changing the extractor.
+  publish no condominium block of their own. The agent does not need a name at all: it
+  identifies an unnamed building from the address plus the unit's fee, size and room counts.
+- A building is looked up **once**. If no year comes back it is parked — no public source
+  states one. `condo-stats` reports `parked_misses` vs `never_searched`; `condo-retry-misses`
+  reopens the parked ones, worth doing after changing the prompt.
+- `condo-golden` re-resolves the 17 hand-verified buildings in
+  `tests/fixtures/condo_golden.csv` and diffs the years, including four negative cases that
+  must come back null. It costs one agent run per row.
 - Condo data is display/analytics only — it never filters a listing out.
-- `condo_overrides.csv` at the repo root (`key,name,built_year`) overrides everything;
-  use it to hand-fix a building the search got wrong.
+- `condo_overrides.csv` at the repo root (`key,name,built_year,block,why`) overrides
+  everything. Set `built_year` to hand-fix a building the resolver got wrong, or
+  `block=1` to say **no year may be stored for this building at all** — the resolver is
+  never called, any cached year is dropped, and `CondoConfidence` reads `not_found`.
+  `block` exists because the alternative way to overrule the resolver is to invent a
+  year, which is the bug this whole tier is here to stop. Two buildings ship blocked:
+  Rua Jose Antonio Coelho 750 and Rua Humberto I 928, where a hand check could not
+  confirm the building and the agent answers anyway from a single source.
+
+### What `Sqm` measures
+
+Zap publishes `usableAreas` and `totalAreas` separately, so its rows carry `Sqm` (private
+area), `SqmTotal` and `SqmBasis = usable`. QuintoAndar publishes exactly one unlabelled
+`area` field — verified live on listing 125652767, where `area` was 141 for a ~119 m2
+apartment, the difference being its two parking spaces — so its rows say
+`SqmBasis = unspecified`. An R$/m2 computed on an `unspecified` row is a floor, not a
+value. There is no way to split the two from QuintoAndar's payload.
 
 Details and the field-coverage measurements are in [PLAN-CONDO-AGE.md](PLAN-CONDO-AGE.md).
 
@@ -89,7 +130,8 @@ sources/
   zapimoveis.py   ← glue-api w/ zone-discovery cache
   quintoandar.py  ← yellow-pages JSON w/ bbox filters
 condos.py      ← building key, name cleanup, registry (.cache/condos.json)
-condo_search.py← year from SERP snippets (serper/brave/google_cse adapters)
+condo_agent.py ← year + name via `claude -p` w/ WebSearch/WebFetch (prompts/)
+condo_search.py← legacy: year from SERP snippets (serper/brave/google_cse)
 http_client.py ← curl-cffi session, pacing, retry, cookie persist
 notion_store.py← upsert / mark_gone / list_alive via data_sources.query
 geo.py         ← Nominatim geocode + haversine distance, cached
