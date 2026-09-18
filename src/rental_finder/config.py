@@ -64,6 +64,11 @@ class Settings(BaseSettings):
     buy_property_types: str = ""
     buy_pets_required: bool = False
     buy_furnished_allowed: bool = True
+    # Drop a listing on what the search hit already says, before paying a detail
+    # fetch for it. Deliberately cannot cover distance (QuintoAndar search hits
+    # carry no coordinates), suites (search sends 0) or the condo fee (search
+    # sends condo+IPTU combined, the filter wants condo alone).
+    buy_prefilter_enabled: bool = True
 
     # Condo enrichment (name + build year + age)
     condo_enrich_enabled: bool = True
@@ -90,6 +95,10 @@ class Settings(BaseSettings):
     # could answer.
     condo_agent_max_usd: float = 1.20
     condo_agent_concurrency: int = 2          # parallel `claude -p` subprocesses
+    # Agent lookups run on their own pool. They used to share the enrich pool,
+    # where a couple of multi-minute subprocesses held workers that 1400 detail
+    # fetches were queued behind. 0 -> mirror condo_agent_concurrency.
+    condo_pool_workers: int = 0
     # A building the search already failed on is parked for good: the year is
     # simply not in any snippet, and re-querying it burns credits every run.
     # Flip this on (or run `condo-retry-misses`) after improving the extractor.
@@ -104,6 +113,12 @@ class Settings(BaseSettings):
     schedule_cron_times: str = "0 9 * * *,0 18 * * *"
     schedule_tz: str = "America/Sao_Paulo"
 
+    # Enrich is the long pole of a buy cycle: every detail fetch sleeps
+    # http_min/max_delay_sec first, so the phase costs roughly
+    # (listings x mean_delay / pool_workers). Raising this scales the request
+    # rate at the source in the same proportion — move it with the delays.
+    pool_workers: int = 10
+
     http_impersonate: str = "chrome146"
     http_min_delay_sec: float = 3.0
     http_max_delay_sec: float = 10.0
@@ -116,6 +131,11 @@ class Settings(BaseSettings):
     # come off a 10-thread pool, so this is paced centrally rather than by
     # shrinking every pool.
     notion_max_rps: float = 2.5
+    # Without this, every upsert spends one query just to learn the row's page
+    # id, and all of them queue behind the pacer above. Priming an
+    # (source, external_id) -> page snapshot costs one query per 100 rows.
+    notion_page_index: bool = True
+    notion_index_page_size: int = 100
 
     geocoder_user_agent: str = "real-estate-scraper/0.1"
     geocoder_rate_limit_sec: float = 1.0
@@ -149,6 +169,13 @@ class Settings(BaseSettings):
             for t in self.condo_apartment_types.split(",")
             if t.strip()
         ]
+
+    @property
+    def condo_pool_size(self) -> int:
+        """Workers for the condo-lookup pool; 0 means follow the agent limit."""
+        if self.condo_pool_workers > 0:
+            return self.condo_pool_workers
+        return max(1, self.condo_agent_concurrency)
 
     @property
     def modules_list(self) -> list[str]:

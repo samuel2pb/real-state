@@ -22,6 +22,10 @@ class Listing:
     lat: float | None
     lng: float | None
     property_type: str = ""
+    # True when the *search* payload already said whether pets are allowed, so
+    # the buy prefilter may act on `pets` without a detail fetch. False means
+    # "unknown, ask the detail page" — never "not allowed".
+    pets_known: bool = False
     address: str = ""
     distance_km: float | None = None
     listed_at: date | None = None  # date the ad was published at the source

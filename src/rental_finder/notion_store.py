@@ -70,6 +70,8 @@ class NotionStore:
         self._ds_cache: dict[str, str] = {}
         self._missing_props: set[str] = set()
         self._schema_ensured: set[str] = set()
+        # kind -> {(source, external_id): page}, primed by prime_index().
+        self._index: dict[str, dict[tuple[str, str], dict]] = {}
         self._lock = threading.Lock()
 
     def _db_id(self, kind: str) -> str:
@@ -194,7 +196,63 @@ class NotionStore:
                 created=current is None,
             )
 
+    def prime_index(self, kind: str) -> int:
+        """Snapshot every row of this base as (source, external_id) -> page.
+
+        upsert_listing otherwise burns one query per listing just to learn the
+        row's page id, and each of those queries queues behind the 2.5 rps
+        pacer. One sweep costs a query per 100 rows instead.
+
+        The snapshot is installed only once the sweep has finished, so a run
+        that fails half way leaves the index absent and _find_page falls back to
+        querying. That ordering is what keeps a partial prime from reading as
+        "row does not exist" and creating duplicates.
+        """
+        if not settings.notion_page_index:
+            return 0
+        ds_id = self._data_source_id(kind)
+        index: dict[tuple[str, str], dict] = {}
+        cursor: str | None = None
+        queries = 0
+        while True:
+            kw: dict = {
+                "data_source_id": ds_id,
+                "page_size": settings.notion_index_page_size,
+            }
+            if cursor:
+                kw["start_cursor"] = cursor
+            r = _retry(self.client.data_sources.query, **kw)
+            queries += 1
+            for page in r.get("results") or []:
+                props = page.get("properties") or {}
+                ext = _plain(props.get("ExternalID"))
+                src = (props.get("Source", {}).get("select") or {}).get("name", "")
+                if ext:
+                    index[(src, ext)] = page
+            if not r.get("has_more"):
+                break
+            cursor = r.get("next_cursor")
+        with self._lock:
+            self._index[kind] = index
+        log.info("notion_index_primed", kind=kind, rows=len(index), queries=queries)
+        return len(index)
+
+    def _remember_page(self, kind: str, source: str, external_id: str, page: dict) -> None:
+        """Register a row this run just created, so a later lookup still hits."""
+        with self._lock:
+            idx = self._index.get(kind)
+            if idx is not None:
+                idx[(source, external_id)] = page
+
     def _find_page(self, kind: str, external_id: str, source: str) -> dict | None:
+        with self._lock:
+            idx = self._index.get(kind)
+        if idx is not None:
+            # A primed index is a complete snapshot plus everything this run has
+            # created, so a miss means the row genuinely is not there. Querying
+            # to confirm would put back exactly the per-listing call the index
+            # exists to remove.
+            return idx.get((source, external_id))
         ds_id = self._data_source_id(kind)
         r = _retry(
             self.client.data_sources.query,
@@ -359,6 +417,7 @@ class NotionStore:
                 )
             else:
                 raise
+        self._remember_page(kind, lst.source, lst.external_id, r)
         log.info("notion_create", id=lst.global_id, page=r["id"])
         return r["id"]
 

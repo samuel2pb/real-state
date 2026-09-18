@@ -59,6 +59,7 @@ def _upsert(kind, old, new):
     st._ds_cache = {kind: "ds"}
     st._missing_props = set()
     st._schema_ensured = set()
+    st._index = {}
     st._lock = threading.Lock()
     st._data_source_id = lambda k: "ds"
     lst = _mk(kind, new)

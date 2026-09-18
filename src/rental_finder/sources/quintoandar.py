@@ -15,6 +15,9 @@ from .base import Source
 
 log = structlog.get_logger(__name__)
 
+# QuintoAndar's amenity code for "pets allowed".
+_PETS_AMENITY = "PODE_TER_ANIMAIS_DE_ESTIMACAO"
+
 BASE = "https://www.quintoandar.com.br"
 _NEXT_RE = re.compile(r"__NEXT_DATA__[^>]*>(.*?)</script>", re.DOTALL)
 
@@ -530,6 +533,13 @@ class QuintoAndarSource(Source):
         sale_price = float(raw.get("salePrice") or 0)
         if sale_price <= 0:
             return None
+        # The search payload carries the same pets flag the detail page serves as
+        # houseInfo.acceptsPets (checked against the detail on 14 listings, 14
+        # agreed, classifieds included). Reading it here lets the buy prefilter
+        # drop pet-less listings without paying for a detail fetch — 585 of the
+        # 1090 rejects on the last full run. An empty list means the payload said
+        # nothing, so pets stays unknown and the detail fetch still happens.
+        amenities = raw.get("amenities") or []
         condo_iptu = float(raw.get("condoIptu") or raw.get("totalCost") or 0)
         neighborhood = raw.get("neighbourhood") or raw.get("regionName") or nb
         addr_raw = raw.get("address")
@@ -557,9 +567,10 @@ class QuintoAndarSource(Source):
             # measures. Probed live on 125652767: `area` was 141, the unit is
             # ~119 m2 and the rest is its two parking spaces.
             sqm_basis="unspecified",
-            pets=False,
             furnished=bool(raw.get("isFurnished")),
             property_type=str(raw.get("type") or ""),
+            pets=_PETS_AMENITY in amenities,
+            pets_known=bool(amenities),
             lat=None,
             lng=None,
             address=f"{addr_str}, {neighborhood}" if addr_str else neighborhood,
