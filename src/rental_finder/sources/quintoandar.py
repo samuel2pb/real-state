@@ -547,6 +547,14 @@ class QuintoAndarSource(Source):
             addr_str = addr_raw.get("address") or ""
         else:
             addr_str = str(addr_raw or "")
+        # Street + number off the search hit alone, so the buy prefilter can ask
+        # the condo registry how old the building is before paying for a detail
+        # fetch. condo_key is deliberately NOT set here: only the detail page's
+        # condominium block is trusted to key a building in the registry, and a
+        # coarse search address must not be written to Notion as one.
+        from ..condos import split_street_number
+
+        hit_street, hit_number = split_street_number(addr_str, None)
         return Listing(
             source=self.name,
             mode="buy",
@@ -574,6 +582,8 @@ class QuintoAndarSource(Source):
             lat=None,
             lng=None,
             address=f"{addr_str}, {neighborhood}" if addr_str else neighborhood,
+            condo_street=hit_street,
+            condo_number=hit_number,
         )
 
     def _fetch_buy_detail(

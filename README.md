@@ -34,6 +34,8 @@ uv run rental-finder condo-lookup "Rua Jose Antonio Coelho" 603 --neighborhood "
 uv run rental-finder condo-golden                      # re-resolve the hand-verified buildings
 uv run rental-finder condo-invalidate --source search  # forget the SERP tier's years
 uv run rental-finder condo-retry-misses                # reopen parked buildings
+uv run rental-finder condo-purge-old --kind buy        # dry run: rows over the age cap
+uv run rental-finder condo-purge-old --kind buy --apply  # trash them (Notion trash, 30 days)
 ```
 
 Run `schedule` inside a VPN session. The HTTP stack uses `curl-cffi` w/ Chrome TLS impersonation + exponential backoff on 403/429 — tolerant to IP changes.
@@ -53,6 +55,7 @@ All params live in `.env`. Key groups:
 | HTTP | `HTTP_IMPERSONATE`, `HTTP_MIN/MAX_DELAY_SEC`, `HTTP_MAX_RETRIES`, `HTTP_PLAYWRIGHT_FALLBACK` |
 | Sources | `SOURCE_ZAPIMOVEIS_ENABLED`, `SOURCE_QUINTOANDAR_ENABLED` |
 | Condo (buy) | `CONDO_ENRICH_ENABLED`, `CONDO_SEARCH_ENABLED`, `CONDO_SEARCH_PROVIDER`, `CONDO_SEARCH_API_KEY`, `CONDO_SEARCH_MAX_PER_RUN`, `CONDO_SEARCH_MIN_CONFIDENCE`, `CONDO_AGENT_MODEL`, `CONDO_AGENT_MAX_USD`, `CONDO_AGENT_CONCURRENCY` |
+| Age gate (buy) | `CONDO_MAX_AGE_YEARS`, `CONDO_AGE_FILTER_ENABLED`, `CONDO_AGE_MIN_CONFIDENCE` |
 
 See `.env.example` for the full annotated list.
 
@@ -96,7 +99,26 @@ Apartment rows get `CondoName`, `BuiltYear`, `CondoAge`, `CondoSource` and
 - `condo-golden` re-resolves the 17 hand-verified buildings in
   `tests/fixtures/condo_golden.csv` and diffs the years, including four negative cases that
   must come back null. It costs one agent run per row.
-- Condo data is display/analytics only — it never filters a listing out.
+- Condo data is display/analytics only, with one exception: the **age gate** below.
+
+### Age gate (buy)
+
+Over half of what the sources return is a building older than 40 years — 389 of the 905 rows
+in the buy base when the gate shipped. Those rows never earn a place:
+
+- `CONDO_MAX_AGE_YEARS` (default 40, `0` disables) caps the age. A listing past it is never
+  upserted, and a row it already had is moved to Notion's trash on the spot.
+- **Only a corroborated year may drop a listing.** `CONDO_AGE_MIN_CONFIDENCE` (default
+  `medium`) is the floor; an unknown, `estimated` or `not_found` year keeps the listing.
+  The gate removes what a resolver proved old, never what is merely unresolved.
+- It costs nothing after the first cycle. The buy prefilter asks the registry for the year
+  by street + number straight off the search hit, so a known-old building is dropped before
+  its detail page is ever fetched — the same tier that already saves ~1000 fetches a run.
+- `condo-purge-old` sweeps the rows already stored. Dry run by default; `--apply` trashes,
+  `--no-include-gone` leaves gone rows alone, and `--resolve` additionally runs the agent on
+  rows with no year at all (that one costs money — dry-run first to see how many).
+- Rows are trashed, not deleted: Notion keeps them recoverable for 30 days.
+- Zap rows are unaffected — zap publishes no condominium block, so nothing there has a year.
 - `condo_overrides.csv` at the repo root (`key,name,built_year,block,why`) overrides
   everything. Set `built_year` to hand-fix a building the resolver got wrong, or
   `block=1` to say **no year may be stored for this building at all** — the resolver is

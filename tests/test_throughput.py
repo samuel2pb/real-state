@@ -203,6 +203,7 @@ def test_prefiltered_listings_are_never_enriched(monkeypatch, buy_settings):
         "kept": 1,
         "upserted": 1,
         "price_drop": 0,
+        "aged_out": 0,
     }
     # A prefiltered listing is still 'seen', or reconcile would mark it gone.
     assert seen == {"keep", "nopets"}

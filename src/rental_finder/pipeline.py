@@ -6,7 +6,15 @@ from datetime import date
 
 import structlog
 
-from .condos import is_apartment, registry, reset_run_budget, resolve_condo
+from .condos import (
+    condo_key,
+    is_apartment,
+    listing_too_old,
+    registry,
+    registry_too_old,
+    reset_run_budget,
+    resolve_condo,
+)
 from .config import settings
 from .geo import distance_km, work_coords
 from .models import Listing
@@ -104,6 +112,14 @@ def _prefilter_buy(lst: Listing) -> bool:
     if not s.buy_furnished_allowed and lst.furnished:
         log.info("buy_prefilter", id=lst.global_id, why="furnished")
         return False
+    # Age, when the building is already in the registry. Free: a cache lookup,
+    # no network and no agent run. Most rejects land here after the first cycle
+    # — 208 of the 286 buildings with a resolved year are over the cap — and
+    # each one also saves the detail fetch this listing would have cost.
+    key = condo_key(lst.condo_street, lst.condo_number)
+    if registry_too_old(key):
+        log.info("buy_prefilter", id=lst.global_id, why="age", v=key)
+        return False
     return True
 
 
@@ -139,25 +155,43 @@ def _enrich_and_filter(
 
 def _finalize(
     lst: Listing, store: NotionStore, today: date, kind: str
-) -> tuple[bool, float | None]:
-    """Condo lookup (kept buy apartments only) + Notion upsert.
+) -> tuple[bool, float | None, str]:
+    """Condo lookup (kept buy apartments only) + age gate + Notion upsert.
 
     Split out of the enrich path so it can run on a different pool: an agent
     lookup is minutes long, and holding an enrich worker for it stalled the
     detail fetches queued behind it.
+
+    Returns (upserted, price_drop, reject_reason).
     """
-    # Only after the listing has earned its Notion row: a condo lookup is an
-    # agent run, and spending one on a listing the filters then drop buys
-    # nothing. Display/analytics only — never allowed to drop a listing.
+    # Only after the listing has passed every other filter: a condo lookup is
+    # an agent run, and spending one on a listing the filters then drop buys
+    # nothing. The year it resolves feeds the age gate below and the columns.
     if _wants_condo(lst, kind):
         try:
             resolve_condo(lst)
         except Exception as e:
             log.warning("condo_resolve_err", id=lst.global_id, err=str(e)[:200])
+    # The one place condo data is allowed to drop a listing: a building past
+    # the age cap never earns a row. An unknown or low-confidence year keeps
+    # the listing, so the gate only removes what a resolver actually proved.
+    if listing_too_old(lst):
+        log.info(
+            "buy_reject",
+            id=lst.global_id,
+            why="age",
+            v=lst.built_year,
+            age=lst.condo_age_years,
+        )
+        # It may already be in Notion from before the gate existed, or from
+        # before its year was resolved. Take it out now rather than leaving a
+        # row the next reconcile would keep touching as alive.
+        store.drop_listing(lst, kind=kind)
+        return False, None, "age"
     lst.last_seen = today
     lst.first_seen = today
     store.upsert_listing(lst, kind=kind)
-    return True, lst.price_drop
+    return True, lst.price_drop, ""
 
 
 def _process_listing(
@@ -172,8 +206,8 @@ def _process_listing(
     """Enrich + filter + upsert one listing end to end. True if upserted."""
     if not _enrich_and_filter(lst, src, work, matches, kind):
         return False
-    _finalize(lst, store, today, kind)
-    return True
+    upserted, _, _ = _finalize(lst, store, today, kind)
+    return upserted
 
 
 def _run_source(
@@ -183,7 +217,14 @@ def _run_source(
     today: date,
     kind: str,
 ) -> tuple[dict, set[str]]:
-    sc = {"fetched": 0, "prefiltered": 0, "kept": 0, "upserted": 0, "price_drop": 0}
+    sc = {
+        "fetched": 0,
+        "prefiltered": 0,
+        "kept": 0,
+        "upserted": 0,
+        "price_drop": 0,
+        "aged_out": 0,
+    }
     seen: set[str] = set()
     seen_lock = threading.Lock()
     matches = _matches_buy_filters if kind == "buy" else _matches_filters
@@ -239,10 +280,12 @@ def _run_source(
     # every finalize future below is already resolved.
     for fut in final_futures:
         try:
-            upserted, price_drop = fut.result()
+            upserted, price_drop, reason = fut.result()
         except Exception as e:
             log.error("listing_error", source=src.name, err=str(e))
             continue
+        if reason == "age":
+            sc["aged_out"] += 1
         if upserted:
             sc["kept"] += 1
             sc["upserted"] += 1
@@ -318,6 +361,7 @@ def run_rent_cycle() -> dict:
         "prefiltered": 0,
         "kept": 0,
         "upserted": 0,
+        "aged_out": 0,
         "gone": 0,
         "price_up": 0,
         "price_drop": 0,
@@ -335,6 +379,7 @@ def run_rent_cycle() -> dict:
             stats["prefiltered"] += sc["prefiltered"]
             stats["kept"] += sc["kept"]
             stats["upserted"] += sc["upserted"]
+            stats["aged_out"] += sc.get("aged_out", 0)
             stats["price_drop"] += sc["price_drop"]
             completed.add(src.name)
         except Exception as e:
@@ -344,6 +389,7 @@ def run_rent_cycle() -> dict:
                 "kept": 0,
                 "upserted": 0,
                 "price_drop": 0,
+                "aged_out": 0,
             }
             log.error("source_error", source=src.name, err=str(e))
         stats["per_source"][src.name] = sc
@@ -369,6 +415,7 @@ def run_buy_cycle() -> dict:
         "prefiltered": 0,
         "kept": 0,
         "upserted": 0,
+        "aged_out": 0,
         "gone": 0,
         "price_up": 0,
         "price_drop": 0,
@@ -386,6 +433,7 @@ def run_buy_cycle() -> dict:
             stats["prefiltered"] += sc["prefiltered"]
             stats["kept"] += sc["kept"]
             stats["upserted"] += sc["upserted"]
+            stats["aged_out"] += sc.get("aged_out", 0)
             stats["price_drop"] += sc["price_drop"]
             completed.add(src.name)
         except Exception as e:
@@ -395,6 +443,7 @@ def run_buy_cycle() -> dict:
                 "kept": 0,
                 "upserted": 0,
                 "price_drop": 0,
+                "aged_out": 0,
             }
             log.error("source_error", source=src.name, err=str(e))
         stats["per_source"][src.name] = sc
@@ -508,6 +557,118 @@ def backfill_condos(
         # Surface it in the command's own output: a run that stopped resolving
         # half way through is not the same as a run that found nothing.
         stats["rate_limited"] = limit_reason()
+    return stats
+
+
+def purge_old_condos(
+    kind: str = "buy",
+    max_age: int | None = None,
+    include_gone: bool = True,
+    apply: bool = False,
+    resolve: bool = False,
+) -> dict:
+    """Trash the rows whose building is past the age cap.
+
+    The discovery gate only covers listings a cycle sees again; this is the
+    one-off sweep over what is already stored. A row's own BuiltYear decides,
+    falling back to the registry when the column was never filled — a building
+    resolved after the row was written is still known locally.
+
+    `apply=False` (the default) only reports. `resolve=True` additionally runs
+    the agent on rows with no year at all, which costs money — off by default.
+    """
+    from .condos import registry as _registry, year_too_old
+
+    if max_age is not None:
+        # Same knob the discovery gate reads, so a purge can never disagree
+        # with what the next cycle would have let through.
+        settings.condo_max_age_years = max_age
+    store = NotionStore()
+    store.ensure_columns(kind)
+    reg = _registry()
+    stats = {
+        "examined": 0,
+        "no_year": 0,
+        "kept": 0,
+        "aged_out": 0,
+        "archived": 0,
+        "resolved": 0,
+    }
+    stats_lock = threading.Lock()
+    if resolve:
+        reset_run_budget()
+
+    def _job(row: dict) -> None:
+        with stats_lock:
+            stats["examined"] += 1
+        year = row.get("built_year")
+        confidence = row.get("condo_confidence") or ""
+        info = reg.lookup(row.get("condo_key") or "")
+        if not year and info and info.built_year:
+            year, confidence = info.built_year, info.year_confidence
+        if not year and resolve and row.get("condo_key"):
+            lst = Listing(
+                source=row["source"],
+                external_id=row["external_id"],
+                url=row["url"],
+                neighborhood=row.get("neighborhood") or "",
+                price_rent=0.0,
+                price_total=0.0,
+                bedrooms=int(row.get("bedrooms") or 0),
+                bathrooms=0,
+                suites=int(row.get("suites") or 0),
+                parking=int(row.get("parking") or 0),
+                sqm=float(row.get("sqm") or 0),
+                pets=False,
+                furnished=None,
+                lat=None,
+                lng=None,
+                mode=kind,
+                condo_fee=float(row.get("condo_fee") or 0),
+                condo_key=row["condo_key"],
+                condo_name=row.get("condo_name") or "",
+            )
+            resolve_condo(lst)
+            year, confidence = lst.built_year, lst.condo_confidence
+            if year:
+                with stats_lock:
+                    stats["resolved"] += 1
+                store.update_condo(row["page_id"], lst)
+        if not year:
+            with stats_lock:
+                stats["no_year"] += 1
+            return
+        if not year_too_old(year, confidence):
+            with stats_lock:
+                stats["kept"] += 1
+            return
+        with stats_lock:
+            stats["aged_out"] += 1
+        log.info(
+            "condo_purge_hit",
+            id=f"{row['source']}:{row['external_id']}",
+            year=year,
+            age=date.today().year - int(year),
+            key=row.get("condo_key"),
+            apply=apply,
+        )
+        if not apply:
+            return
+        store.archive_page(row["page_id"])
+        with stats_lock:
+            stats["archived"] += 1
+
+    rows = list(store.list_alive(kind=kind))
+    if include_gone:
+        rows += list(store.list_gone(kind=kind))
+    workers = settings.condo_pool_size if resolve else settings.pool_workers
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_job, row) for row in rows]
+        for fut in as_completed(futures):
+            try:
+                fut.result()
+            except Exception as e:
+                log.error("condo_purge_error", kind=kind, err=str(e))
     return stats
 
 

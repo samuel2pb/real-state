@@ -105,6 +105,19 @@ class Settings(BaseSettings):
     condo_search_retry_misses: bool = False
     condo_search_retry_days: int = 90  # only applies when retry_misses is on
 
+    # Age gate. 208 of the 286 buildings with a known year are over 40 years
+    # old, so most of what the sources return is junk we never want a row for.
+    # Enforced at discovery (never upserted) and by `condo-purge-old` on the
+    # rows already in Notion.
+    condo_max_age_years: int = 40      # 0 disables the gate
+    condo_age_filter_enabled: bool = True
+    # A year is only allowed to drop a listing at or above this confidence.
+    # Dropping on an "estimated" year would throw away good buildings over a
+    # number nobody corroborated.
+    condo_age_min_confidence: Literal["estimated", "medium", "high"] = "medium"
+    # A building whose year nobody could establish stays. The gate removes what
+    # is provably old, not what is merely unknown.
+
     work_address: str
     work_max_distance_km: float = 5.5
     work_lat: float | None = None

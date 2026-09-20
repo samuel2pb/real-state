@@ -494,6 +494,39 @@ def is_apartment(lst: Listing) -> bool:
 _CONF_ORDER = {"": 0, "not_found": 0, "estimated": 1, "medium": 2, "high": 3}
 
 
+def year_too_old(year: int | None, confidence: str = "") -> bool:
+    """Is a building of this year past the age cap?
+
+    False for an unknown year and for a year nobody corroborated: the gate
+    exists to drop what is provably old, never what is merely unresolved.
+    """
+    s = settings
+    if not (s.condo_age_filter_enabled and s.condo_max_age_years > 0) or not year:
+        return False
+    floor = _CONF_ORDER.get(s.condo_age_min_confidence, 2)
+    if _CONF_ORDER.get(confidence, 0) < floor:
+        return False
+    return (date.today().year - int(year)) > s.condo_max_age_years
+
+
+def listing_too_old(lst: Listing) -> bool:
+    return year_too_old(lst.built_year, lst.condo_confidence)
+
+
+def registry_too_old(key: str) -> bool:
+    """Age verdict from the cache alone — no network, no agent, no cost.
+
+    This is what makes the gate cheap on every run after the first: a building
+    resolved once is rejected for free for every listing in it, forever.
+    """
+    if not key:
+        return False
+    info = registry().lookup(key)
+    if info is None or info.blocked:
+        return False
+    return year_too_old(info.built_year, info.year_confidence)
+
+
 def _apply_registry(lst: Listing, info: CondoInfo | None) -> None:
     """Copy what the registry knows about this building onto the listing."""
     if not info:
@@ -554,7 +587,11 @@ def _lookup_year(lst: Listing):
 
 
 def resolve_condo(lst: Listing, *, allow_search: bool = True) -> None:
-    """Fill condo name / built year / age / confidence. Never filters a listing."""
+    """Fill condo name / built year / age / confidence.
+
+    Resolution itself never drops anything; the age gate in the pipeline reads
+    what lands here and is the only place condo data rejects a listing.
+    """
     if not lst.condo_key:
         log.info("condo_key_missing", id=lst.global_id, condo=lst.condo_name_raw)
         return

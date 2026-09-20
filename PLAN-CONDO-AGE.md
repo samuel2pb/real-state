@@ -301,7 +301,10 @@ Sources: [Base dos Dados — Cadastro do IPTU SP](https://basedosdados.org/datas
 - **ZapImóveis, entirely.** For the record: zap's glue API returns `condominiumName = ""` on 30/30 sampled USED sale listings, and its detail page is 403 Cloudflare via both `curl_cffi` and a headless browser. (Unrelated but noted while probing: `ZapSource.check_alive` ([src/rental_finder/sources/zapimoveis.py:422](src/rental_finder/sources/zapimoveis.py#L422)) always returns `True` because of that same 403 — separate bug, separate task.)
 - **Fetching the condo pages themselves** (loft/imovelweb/123i/casamineira). All 403; snippets are enough. Do not add a scraper for them.
 - Rent module surfacing (code path is flag-ready; do not enable).
-- Filtering or scoring by age — display only for now.
+- ~~Filtering or scoring by age — display only for now.~~ **Shipped 2026-09-19:** a year at
+  `medium`+ confidence over `CONDO_MAX_AGE_YEARS` (40) now drops the listing at discovery
+  and trashes any row it already had; `condo-purge-old` sweeps the stored base. An unknown
+  or uncorroborated year still keeps the listing.
 - `listingType=DEVELOPMENT` launches and their delivery calendars.
 - Any Notion schema migration beyond the additive columns.
 

@@ -104,6 +104,47 @@ def condo_backfill_cmd(
     typer.echo({"kind": kind, **stats})
 
 
+@app.command("condo-purge-old")
+def condo_purge_old_cmd(
+    kind: str = typer.Option("buy", help="'buy' or 'rent'"),
+    max_age: int = typer.Option(
+        0, help="Age cap in years (0 = use CONDO_MAX_AGE_YEARS)"
+    ),
+    include_gone: bool = typer.Option(True, help="Also sweep rows marked gone"),
+    resolve: bool = typer.Option(
+        False,
+        help="Run the agent on rows with no year at all. Costs money — a dry "
+        "run first will say how many rows that is.",
+    ),
+    apply: bool = typer.Option(
+        False, "--apply", help="Actually trash the rows (default: report only)"
+    ),
+    yes: bool = typer.Option(False, "--yes", help="Skip the confirmation prompt"),
+) -> None:
+    """Trash rows whose building is past the age cap. Dry run unless --apply.
+
+    Rows go to Notion's trash, recoverable for 30 days. A row with no
+    trustworthy year is kept, never trashed on a guess.
+    """
+    _init_logging()
+    from .pipeline import purge_old_condos
+
+    if apply and not yes:
+        typer.confirm(
+            f"Trash every {kind} row older than "
+            f"{max_age or settings.condo_max_age_years} years?",
+            abort=True,
+        )
+    stats = purge_old_condos(
+        kind=kind,
+        max_age=max_age or None,
+        include_gone=include_gone,
+        apply=apply,
+        resolve=resolve,
+    )
+    typer.echo({"kind": kind, "apply": apply, **stats})
+
+
 @app.command("condo-stats")
 def condo_stats_cmd() -> None:
     """Print what the local condo registry knows."""

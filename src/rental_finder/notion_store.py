@@ -421,6 +421,36 @@ class NotionStore:
         log.info("notion_create", id=lst.global_id, page=r["id"])
         return r["id"]
 
+    def archive_page(self, page_id: str) -> None:
+        """Move a row to Notion's trash.
+
+        Trash, not a hard delete: the row is recoverable for 30 days, which is
+        the difference between a junk filter and losing data to a wrong year.
+        """
+        _retry(self.client.pages.update, page_id=page_id, in_trash=True)
+
+    def _forget_page(self, kind: str, source: str, external_id: str) -> None:
+        """Drop a row from the primed index after it left the base.
+
+        Without this the snapshot still hands the trashed page back to
+        _find_page and the next upsert patches an archived row, which Notion
+        rejects.
+        """
+        with self._lock:
+            idx = self._index.get(kind)
+            if idx is not None:
+                idx.pop((source, external_id), None)
+
+    def drop_listing(self, lst: Listing, kind: str = "rent") -> bool:
+        """Trash this listing's row if it has one. True when a row was removed."""
+        page = self._find_page(kind, lst.external_id, lst.source)
+        if not page:
+            return False
+        self.archive_page(page["id"])
+        self._forget_page(kind, lst.source, lst.external_id)
+        log.info("notion_archived", id=lst.global_id, page=page["id"])
+        return True
+
     def mark_gone(self, page_id: str) -> None:
         _retry(
             self.client.pages.update,
