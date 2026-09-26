@@ -494,37 +494,67 @@ def is_apartment(lst: Listing) -> bool:
 _CONF_ORDER = {"": 0, "not_found": 0, "estimated": 1, "medium": 2, "high": 3}
 
 
-def year_too_old(year: int | None, confidence: str = "") -> bool:
-    """Is a building of this year past the age cap?
-
-    False for an unknown year and for a year nobody corroborated: the gate
-    exists to drop what is provably old, never what is merely unresolved.
-    """
+def _gate_on() -> bool:
     s = settings
-    if not (s.condo_age_filter_enabled and s.condo_max_age_years > 0) or not year:
+    return s.condo_age_filter_enabled and s.condo_max_age_years > 0
+
+
+def year_trusted(year: int | None, confidence: str = "") -> bool:
+    """A year good enough to decide on: present and at the confidence floor."""
+    floor = _CONF_ORDER.get(settings.condo_age_min_confidence, 2)
+    return bool(year) and _CONF_ORDER.get(confidence, 0) >= floor
+
+
+def year_too_old(year: int | None, confidence: str = "") -> bool:
+    """Is a building of this year provably past the age cap?
+
+    Only a trusted year can prove it. Whether an *unknown* year is acceptable
+    is a separate question — see age_verdict.
+    """
+    if not _gate_on() or not year_trusted(year, confidence):
         return False
-    floor = _CONF_ORDER.get(s.condo_age_min_confidence, 2)
-    if _CONF_ORDER.get(confidence, 0) < floor:
-        return False
-    return (date.today().year - int(year)) > s.condo_max_age_years
+    return (date.today().year - int(year)) > settings.condo_max_age_years
 
 
-def listing_too_old(lst: Listing) -> bool:
-    return year_too_old(lst.built_year, lst.condo_confidence)
+def age_verdict(year: int | None, confidence: str = "") -> str:
+    """'' keeps the listing; 'age' = too old; 'age_unknown' = no trusted year.
+
+    An uncorroborated year counts as unknown, not as young: with
+    condo_age_require_known on, it is rejected like a missing one.
+    """
+    if not _gate_on():
+        return ""
+    if year_too_old(year, confidence):
+        return "age"
+    if settings.condo_age_require_known and not year_trusted(year, confidence):
+        return "age_unknown"
+    return ""
 
 
-def registry_too_old(key: str) -> bool:
+def listing_age_verdict(lst: Listing) -> str:
+    return age_verdict(lst.built_year, lst.condo_confidence)
+
+
+def registry_age_verdict(key: str) -> str:
     """Age verdict from the cache alone — no network, no agent, no cost.
 
     This is what makes the gate cheap on every run after the first: a building
-    resolved once is rejected for free for every listing in it, forever.
+    resolved once is decided for free for every listing in it, forever. Only
+    a *final* answer rejects here. A building nobody has searched yet goes on
+    to the detail fetch and the resolver, and is decided after that.
     """
-    if not key:
-        return False
+    if not key or not _gate_on():
+        return ""
     info = registry().lookup(key)
-    if info is None or info.blocked:
-        return False
-    return year_too_old(info.built_year, info.year_confidence)
+    if info is None:
+        return ""
+    if info.blocked:
+        # Nobody may state a year for it, so its age can never become known.
+        return "age_unknown" if settings.condo_age_require_known else ""
+    verdict = age_verdict(info.built_year, info.year_confidence)
+    if verdict == "age_unknown" and registry().needs_search(key):
+        return ""  # still resolvable: let this run try
+    return verdict
 
 
 def _apply_registry(lst: Listing, info: CondoInfo | None) -> None:

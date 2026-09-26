@@ -54,6 +54,9 @@ def lookups(monkeypatch):
     monkeypatch.setattr(pipeline, "resolve_condo", lambda lst: calls.append(lst))
     monkeypatch.setattr(pipeline.settings, "condo_enrich_enabled", True)
     monkeypatch.setattr(pipeline.settings, "work_max_distance_km", 5.5)
+    # The stub resolver finds no year; this module is about *when* the lookup
+    # runs, not what the age gate does with its answer.
+    monkeypatch.setattr(pipeline.settings, "condo_age_require_known", False)
     return calls
 
 

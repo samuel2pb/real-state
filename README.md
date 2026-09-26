@@ -55,7 +55,7 @@ All params live in `.env`. Key groups:
 | HTTP | `HTTP_IMPERSONATE`, `HTTP_MIN/MAX_DELAY_SEC`, `HTTP_MAX_RETRIES`, `HTTP_PLAYWRIGHT_FALLBACK` |
 | Sources | `SOURCE_ZAPIMOVEIS_ENABLED`, `SOURCE_QUINTOANDAR_ENABLED` |
 | Condo (buy) | `CONDO_ENRICH_ENABLED`, `CONDO_SEARCH_ENABLED`, `CONDO_SEARCH_PROVIDER`, `CONDO_SEARCH_API_KEY`, `CONDO_SEARCH_MAX_PER_RUN`, `CONDO_SEARCH_MIN_CONFIDENCE`, `CONDO_AGENT_MODEL`, `CONDO_AGENT_MAX_USD`, `CONDO_AGENT_CONCURRENCY` |
-| Age gate (buy) | `CONDO_MAX_AGE_YEARS`, `CONDO_AGE_FILTER_ENABLED`, `CONDO_AGE_MIN_CONFIDENCE` |
+| Age gate (buy) | `CONDO_MAX_AGE_YEARS`, `CONDO_AGE_FILTER_ENABLED`, `CONDO_AGE_MIN_CONFIDENCE`, `CONDO_AGE_REQUIRE_KNOWN` |
 
 See `.env.example` for the full annotated list.
 
@@ -108,9 +108,13 @@ in the buy base when the gate shipped. Those rows never earn a place:
 
 - `CONDO_MAX_AGE_YEARS` (default 40, `0` disables) caps the age. A listing past it is never
   upserted, and a row it already had is moved to Notion's trash on the spot.
-- **Only a corroborated year may drop a listing.** `CONDO_AGE_MIN_CONFIDENCE` (default
-  `medium`) is the floor; an unknown, `estimated` or `not_found` year keeps the listing.
-  The gate removes what a resolver proved old, never what is merely unresolved.
+- **No trusted year, no row** (`CONDO_AGE_REQUIRE_KNOWN`, default on). A year counts only at
+  `CONDO_AGE_MIN_CONFIDENCE` (default `medium`) or better; unknown, `estimated` and `not_found`
+  are rejected as `age_unknown`. That covers classifieds with no building address to look
+  up, buildings no public source dates, blocked buildings, and `condo_house` listings (never
+  resolved). A building merely not resolved *yet* — never searched, per-run cap
+  (`CONDO_SEARCH_MAX_PER_RUN`) hit, agent unreachable — is rejected this run and tried again
+  the next time the listing is fetched. Turn the flag off to keep unknown years instead.
 - It costs nothing after the first cycle. The buy prefilter asks the registry for the year
   by street + number straight off the search hit, so a known-old building is dropped before
   its detail page is ever fetched — the same tier that already saves ~1000 fetches a run.

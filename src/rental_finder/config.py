@@ -115,8 +115,13 @@ class Settings(BaseSettings):
     # Dropping on an "estimated" year would throw away good buildings over a
     # number nobody corroborated.
     condo_age_min_confidence: Literal["estimated", "medium", "high"] = "medium"
-    # A building whose year nobody could establish stays. The gate removes what
-    # is provably old, not what is merely unknown.
+    # No trusted year = no row. 88 of 208 live rows had no year on 2026-09-25:
+    # 47 classifieds with no building address to look up, 39 buildings no
+    # public source dates, 2 blocked by hand. A listing whose building is simply
+    # not resolved *yet* (never searched, per-run cap hit, agent unreachable) is
+    # rejected this run and gets its chance again the next time it is fetched.
+    # Buy only — rent never resolves condo data. Off -> unknown years stay.
+    condo_age_require_known: bool = True
 
     work_address: str
     work_max_distance_km: float = 5.5

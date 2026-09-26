@@ -5,8 +5,9 @@ import pytest
 from rental_finder import condos, pipeline
 from rental_finder.condos import (
     CondoRegistry,
-    listing_too_old,
-    registry_too_old,
+    age_verdict,
+    listing_age_verdict,
+    registry_age_verdict,
     year_too_old,
 )
 from rental_finder.config import settings
@@ -45,6 +46,7 @@ def _gate_on(monkeypatch):
     monkeypatch.setattr(settings, "condo_age_filter_enabled", True)
     monkeypatch.setattr(settings, "condo_max_age_years", 40)
     monkeypatch.setattr(settings, "condo_age_min_confidence", "medium")
+    monkeypatch.setattr(settings, "condo_age_require_known", True)
 
 
 def test_old_building_rejected():
@@ -75,13 +77,37 @@ def test_zero_cap_disables(monkeypatch):
     assert not year_too_old(1900, "high")
 
 
-def test_listing_too_old_uses_listing_fields():
+def test_listing_verdict_uses_listing_fields():
     lst = _mk()
     lst.apply_built_year(CUR - 50)
     lst.condo_confidence = "high"
-    assert listing_too_old(lst)
+    assert listing_age_verdict(lst) == "age"
     lst.apply_built_year(CUR - 5)
-    assert not listing_too_old(lst)
+    assert listing_age_verdict(lst) == ""
+
+
+# --- unknown age ----------------------------------------------------------
+
+
+def test_unknown_year_rejected_when_required():
+    assert age_verdict(None, "") == "age_unknown"
+    assert age_verdict(None, "not_found") == "age_unknown"
+
+
+def test_uncorroborated_year_counts_as_unknown():
+    """A young 'estimated' year is not proof of youth either."""
+    assert age_verdict(CUR - 5, "estimated") == "age_unknown"
+
+
+def test_unknown_year_kept_when_not_required(monkeypatch):
+    monkeypatch.setattr(settings, "condo_age_require_known", False)
+    assert age_verdict(None, "") == ""
+    assert age_verdict(CUR - 5, "estimated") == ""
+
+
+def test_gate_off_keeps_unknown(monkeypatch):
+    monkeypatch.setattr(settings, "condo_age_filter_enabled", False)
+    assert age_verdict(None, "") == ""
 
 
 # --- registry tier (the free one) -----------------------------------------
@@ -101,19 +127,30 @@ def test_registry_too_old(reg):
         source="claude",
         year_confidence="high",
     )
-    assert registry_too_old("rua x|10")
+    assert registry_age_verdict("rua x|10") == "age"
 
 
-def test_registry_unknown_building_kept(reg):
-    assert not registry_too_old("rua nunca vista|1")
-    assert not registry_too_old("")
+def test_registry_unseen_building_goes_on_to_resolve(reg):
+    """Never searched: not a final answer, the resolver still gets its try."""
+    assert registry_age_verdict("rua nunca vista|1") == ""
+    assert registry_age_verdict("") == ""
 
 
-def test_registry_blocked_building_kept(reg):
-    """A blocked building has no trustworthy year, so it survives the gate."""
+def test_registry_parked_miss_is_final_unknown(reg):
+    reg.learn("rua z|3", source="claude", searched_at=date.today().isoformat())
+    assert registry_age_verdict("rua z|3") == "age_unknown"
+
+
+def test_registry_blocked_building_is_unknown(reg):
     reg.learn("rua y|2", built_year=1950, source="manual", year_confidence="high")
     reg.learn("rua y|2", source="manual", blocked=True)
-    assert not registry_too_old("rua y|2")
+    assert registry_age_verdict("rua y|2") == "age_unknown"
+
+
+def test_registry_blocked_kept_when_unknown_allowed(reg, monkeypatch):
+    monkeypatch.setattr(settings, "condo_age_require_known", False)
+    reg.learn("rua y|2", source="manual", blocked=True)
+    assert registry_age_verdict("rua y|2") == ""
 
 
 # --- pipeline wiring ------------------------------------------------------
@@ -177,8 +214,27 @@ def test_finalize_keeps_recent(monkeypatch, reg):
     assert store.upserted == ["1"]
 
 
-def test_finalize_keeps_unknown_year(monkeypatch, reg):
+def test_finalize_rejects_unknown_year(monkeypatch, reg):
     monkeypatch.setattr(pipeline, "_wants_condo", lambda lst, kind: False)
     store = _FakeStore()
     upserted, _, reason = pipeline._finalize(_mk(), store, date.today(), "buy")
+    assert (upserted, reason) == (False, "age_unknown")
+    assert store.upserted == [] and store.dropped == ["1"]
+
+
+def test_finalize_keeps_unknown_year_when_allowed(monkeypatch, reg):
+    monkeypatch.setattr(settings, "condo_age_require_known", False)
+    monkeypatch.setattr(pipeline, "_wants_condo", lambda lst, kind: False)
+    store = _FakeStore()
+    upserted, _, reason = pipeline._finalize(_mk(), store, date.today(), "buy")
+    assert (upserted, reason) == (True, "")
+
+
+def test_rent_never_gated_on_age(monkeypatch, reg):
+    """Rent resolves no condo data; requiring a year there would empty it."""
+    monkeypatch.setattr(pipeline, "_wants_condo", lambda lst, kind: False)
+    store = _FakeStore()
+    upserted, _, reason = pipeline._finalize(
+        _mk(mode="rent"), store, date.today(), "rent"
+    )
     assert (upserted, reason) == (True, "")

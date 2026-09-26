@@ -60,6 +60,9 @@ def buy_settings(monkeypatch):
         ("buy_pets_required", True),
         ("buy_furnished_allowed", True),
         ("buy_prefilter_enabled", True),
+        # These tests are about pools and fetch counts, not age; their
+        # listings carry no year. The age gate has its own test module.
+        ("condo_age_require_known", False),
     ):
         monkeypatch.setattr(s, k, v)
     return s
@@ -204,6 +207,7 @@ def test_prefiltered_listings_are_never_enriched(monkeypatch, buy_settings):
         "upserted": 1,
         "price_drop": 0,
         "aged_out": 0,
+        "age_unknown": 0,
     }
     # A prefiltered listing is still 'seen', or reconcile would mark it gone.
     assert seen == {"keep", "nopets"}

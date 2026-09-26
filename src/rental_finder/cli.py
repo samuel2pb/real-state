@@ -121,10 +121,10 @@ def condo_purge_old_cmd(
     ),
     yes: bool = typer.Option(False, "--yes", help="Skip the confirmation prompt"),
 ) -> None:
-    """Trash rows whose building is past the age cap. Dry run unless --apply.
+    """Trash rows the age gate would refuse. Dry run unless --apply.
 
-    Rows go to Notion's trash, recoverable for 30 days. A row with no
-    trustworthy year is kept, never trashed on a guess.
+    Past the age cap, or (CONDO_AGE_REQUIRE_KNOWN) with a year that can no
+    longer be found. Rows go to Notion's trash, recoverable for 30 days.
     """
     _init_logging()
     from .pipeline import purge_old_condos
@@ -132,7 +132,12 @@ def condo_purge_old_cmd(
     if apply and not yes:
         typer.confirm(
             f"Trash every {kind} row older than "
-            f"{max_age or settings.condo_max_age_years} years?",
+            f"{max_age or settings.condo_max_age_years} years"
+            + (
+                " or with no known build year?"
+                if settings.condo_age_require_known
+                else "?"
+            ),
             abort=True,
         )
     stats = purge_old_condos(

@@ -9,9 +9,9 @@ import structlog
 from .condos import (
     condo_key,
     is_apartment,
-    listing_too_old,
+    listing_age_verdict,
     registry,
-    registry_too_old,
+    registry_age_verdict,
     reset_run_budget,
     resolve_condo,
 )
@@ -112,13 +112,13 @@ def _prefilter_buy(lst: Listing) -> bool:
     if not s.buy_furnished_allowed and lst.furnished:
         log.info("buy_prefilter", id=lst.global_id, why="furnished")
         return False
-    # Age, when the building is already in the registry. Free: a cache lookup,
-    # no network and no agent run. Most rejects land here after the first cycle
-    # — 208 of the 286 buildings with a resolved year are over the cap — and
-    # each one also saves the detail fetch this listing would have cost.
+    # Age, when the registry already has the final word on the building — too
+    # old, or never datable. Free: a cache lookup, no network and no agent run,
+    # and each reject also saves the detail fetch this listing would have cost.
     key = condo_key(lst.condo_street, lst.condo_number)
-    if registry_too_old(key):
-        log.info("buy_prefilter", id=lst.global_id, why="age", v=key)
+    why = registry_age_verdict(key)
+    if why:
+        log.info("buy_prefilter", id=lst.global_id, why=why, v=key)
         return False
     return True
 
@@ -173,21 +173,24 @@ def _finalize(
         except Exception as e:
             log.warning("condo_resolve_err", id=lst.global_id, err=str(e)[:200])
     # The one place condo data is allowed to drop a listing: a building past
-    # the age cap never earns a row. An unknown or low-confidence year keeps
-    # the listing, so the gate only removes what a resolver actually proved.
-    if listing_too_old(lst):
+    # the age cap, or one with no trusted year (condo_age_require_known), never
+    # earns a row. Buy only — rent never resolves condo data.
+    why = listing_age_verdict(lst) if kind == "buy" else ""
+    if why:
         log.info(
             "buy_reject",
             id=lst.global_id,
-            why="age",
+            why=why,
             v=lst.built_year,
             age=lst.condo_age_years,
+            key=lst.condo_key,
+            confidence=lst.condo_confidence,
         )
         # It may already be in Notion from before the gate existed, or from
         # before its year was resolved. Take it out now rather than leaving a
         # row the next reconcile would keep touching as alive.
         store.drop_listing(lst, kind=kind)
-        return False, None, "age"
+        return False, None, why
     lst.last_seen = today
     lst.first_seen = today
     store.upsert_listing(lst, kind=kind)
@@ -224,6 +227,7 @@ def _run_source(
         "upserted": 0,
         "price_drop": 0,
         "aged_out": 0,
+        "age_unknown": 0,
     }
     seen: set[str] = set()
     seen_lock = threading.Lock()
@@ -286,6 +290,8 @@ def _run_source(
             continue
         if reason == "age":
             sc["aged_out"] += 1
+        elif reason == "age_unknown":
+            sc["age_unknown"] += 1
         if upserted:
             sc["kept"] += 1
             sc["upserted"] += 1
@@ -362,6 +368,7 @@ def run_rent_cycle() -> dict:
         "kept": 0,
         "upserted": 0,
         "aged_out": 0,
+        "age_unknown": 0,
         "gone": 0,
         "price_up": 0,
         "price_drop": 0,
@@ -380,6 +387,7 @@ def run_rent_cycle() -> dict:
             stats["kept"] += sc["kept"]
             stats["upserted"] += sc["upserted"]
             stats["aged_out"] += sc.get("aged_out", 0)
+            stats["age_unknown"] += sc.get("age_unknown", 0)
             stats["price_drop"] += sc["price_drop"]
             completed.add(src.name)
         except Exception as e:
@@ -390,6 +398,7 @@ def run_rent_cycle() -> dict:
                 "upserted": 0,
                 "price_drop": 0,
                 "aged_out": 0,
+                "age_unknown": 0,
             }
             log.error("source_error", source=src.name, err=str(e))
         stats["per_source"][src.name] = sc
@@ -416,6 +425,7 @@ def run_buy_cycle() -> dict:
         "kept": 0,
         "upserted": 0,
         "aged_out": 0,
+        "age_unknown": 0,
         "gone": 0,
         "price_up": 0,
         "price_drop": 0,
@@ -434,6 +444,7 @@ def run_buy_cycle() -> dict:
             stats["kept"] += sc["kept"]
             stats["upserted"] += sc["upserted"]
             stats["aged_out"] += sc.get("aged_out", 0)
+            stats["age_unknown"] += sc.get("age_unknown", 0)
             stats["price_drop"] += sc["price_drop"]
             completed.add(src.name)
         except Exception as e:
@@ -444,6 +455,7 @@ def run_buy_cycle() -> dict:
                 "upserted": 0,
                 "price_drop": 0,
                 "aged_out": 0,
+                "age_unknown": 0,
             }
             log.error("source_error", source=src.name, err=str(e))
         stats["per_source"][src.name] = sc
@@ -567,17 +579,22 @@ def purge_old_condos(
     apply: bool = False,
     resolve: bool = False,
 ) -> dict:
-    """Trash the rows whose building is past the age cap.
+    """Trash the rows the discovery gate would now refuse.
+
+    That is a building past the age cap, and — with condo_age_require_known —
+    one whose year is finally unknown: no building address, blocked, or
+    searched with no answer. A row whose building was simply never searched is
+    left alone ("pending"); `resolve=True` searches it now.
 
     The discovery gate only covers listings a cycle sees again; this is the
-    one-off sweep over what is already stored. A row's own BuiltYear decides,
-    falling back to the registry when the column was never filled — a building
-    resolved after the row was written is still known locally.
+    sweep over what is already stored. A row's own BuiltYear decides, falling
+    back to the registry when the column was never filled — a building resolved
+    after the row was written is still known locally.
 
     `apply=False` (the default) only reports. `resolve=True` additionally runs
     the agent on rows with no year at all, which costs money — off by default.
     """
-    from .condos import registry as _registry, year_too_old
+    from .condos import age_verdict, registry as _registry
 
     if max_age is not None:
         # Same knob the discovery gate reads, so a purge can never disagree
@@ -589,8 +606,10 @@ def purge_old_condos(
     stats = {
         "examined": 0,
         "no_year": 0,
+        "pending": 0,
         "kept": 0,
         "aged_out": 0,
+        "unknown_out": 0,
         "archived": 0,
         "resolved": 0,
     }
@@ -634,22 +653,31 @@ def purge_old_condos(
                 with stats_lock:
                     stats["resolved"] += 1
                 store.update_condo(row["page_id"], lst)
-        if not year:
+        key = row.get("condo_key") or ""
+        verdict = age_verdict(year, confidence)
+        if verdict == "age_unknown":
             with stats_lock:
                 stats["no_year"] += 1
-            return
-        if not year_too_old(year, confidence):
+            if key and reg.needs_search(key):
+                # Never searched (or the lookup did not get through): the year
+                # may still be found, so this is not a final unknown. Trashing
+                # it would only have the next cycle resolve and re-add it.
+                with stats_lock:
+                    stats["pending"] += 1
+                return
+        if not verdict:
             with stats_lock:
                 stats["kept"] += 1
             return
         with stats_lock:
-            stats["aged_out"] += 1
+            stats["aged_out" if verdict == "age" else "unknown_out"] += 1
         log.info(
             "condo_purge_hit",
             id=f"{row['source']}:{row['external_id']}",
+            why=verdict,
             year=year,
-            age=date.today().year - int(year),
-            key=row.get("condo_key"),
+            age=(date.today().year - int(year)) if year else None,
+            key=key,
             apply=apply,
         )
         if not apply:
