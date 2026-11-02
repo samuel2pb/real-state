@@ -4,23 +4,6 @@ from __future__ import annotations
 
 from rental_finder.notion_store import _area_props
 from rental_finder.sources.quintoandar import QuintoAndarSource
-from rental_finder.sources.zapimoveis import ZapSource
-
-
-def test_zap_keeps_usable_and_total_apart():
-    raw = {
-        "listing": {
-            "id": "1",
-            "pricingInfos": [{"businessType": "SALE", "price": 900000}],
-            "usableAreas": ["119"],
-            "totalAreas": ["141"],
-            "address": {},
-            "unitTypes": ["APARTMENT"],
-        },
-        "link": {"href": "/imovel/1/"},
-    }
-    lst = ZapSource()._parse_buy_one(raw, "Vila Mariana")
-    assert (lst.sqm, lst.sqm_total, lst.sqm_basis) == (119.0, 141.0, "usable")
 
 
 def test_quintoandar_area_is_unlabelled():

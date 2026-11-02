@@ -354,6 +354,7 @@ def _reconcile_alive(
 
 
 def run_rent_cycle() -> dict:
+    settings.require_configured("rent")
     work = work_coords()
     store = NotionStore()
     store.ensure_columns("rent")
@@ -410,6 +411,7 @@ def run_rent_cycle() -> dict:
 
 
 def run_buy_cycle() -> dict:
+    settings.require_configured("buy")
     work = work_coords()
     store = NotionStore()
     store.ensure_columns("buy")
@@ -485,6 +487,7 @@ def backfill_condos(
     every building in the base is ~7 hours of agent time, while the shortlist
     that actually gets read is a few dozen rows — do that one first and measure.
     """
+    settings.require_configured(kind)
     wanted = {n.strip().lower() for n in (neighborhoods or []) if n.strip()}
     if max_searches is not None:
         settings.condo_search_max_per_run = max_searches
@@ -594,6 +597,7 @@ def purge_old_condos(
     `apply=False` (the default) only reports. `resolve=True` additionally runs
     the agent on rows with no year at all, which costs money — off by default.
     """
+    settings.require_configured(kind)
     from .condos import age_verdict, registry as _registry
 
     if max_age is not None:
@@ -707,6 +711,7 @@ def backfill_listed_at(kind: str = "rent", include_gone: bool = True) -> dict:
     price-up / price-drop rows keep counting availability from FirstSeen unless
     they are backfilled here. Rows that already carry a date are skipped.
     """
+    settings.require_configured(kind)
     store = NotionStore()
     store.ensure_columns(kind)
     sources = enabled_sources(mode=kind)
@@ -761,6 +766,7 @@ def recheck_gone(kind: str = "rent") -> dict:
     Live + current price > max -> mark_price_up. Else leave gone.
     Intended as an occasional backfill, NOT called automatically from run cycles.
     """
+    settings.require_configured(kind)
     store = NotionStore()
     store.ensure_columns(kind)
     sources = enabled_sources(mode=kind)
@@ -792,4 +798,32 @@ def recheck_gone(kind: str = "rent") -> dict:
         else:
             stats["skipped"] += 1
 
+    return stats
+
+
+def drop_source(kind: str, source: str, apply: bool = False) -> dict:
+    """Trash every row of the `kind` base whose Source is `source`.
+
+    For sources that no longer exist (ZapImóveis, removed 2026-11-02): the cycles
+    never touch those rows again, so they would sit in the base forever. Dry run
+    unless `apply`; rows go to Notion's trash, recoverable for 30 days.
+    """
+    settings.require_configured()
+    store = NotionStore()
+    rows = list(store.list_by_source(kind, source))
+    by_status: dict[str, int] = {}
+    for row in rows:
+        st = row.get("status") or "unknown"
+        by_status[st] = by_status.get(st, 0) + 1
+    stats = {"matched": len(rows), "by_status": by_status, "trashed": 0, "failed": 0}
+    if not apply:
+        return stats
+    for row in rows:
+        try:
+            store.archive_page(row["page_id"])
+            stats["trashed"] += 1
+        except Exception as e:  # keep going; report the count
+            stats["failed"] += 1
+            log.warning("drop_source_failed", page=row["page_id"], err=str(e))
+    log.info("drop_source", kind=kind, source=source, **{k: v for k, v in stats.items() if k != "by_status"})
     return stats

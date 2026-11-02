@@ -9,6 +9,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 ROOT = Path(__file__).resolve().parents[2]
 
 
+class NotConfiguredError(RuntimeError):
+    """The .env is missing or lacks a value the command needs."""
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=str(ROOT / ".env"),
@@ -17,20 +21,20 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    notion_token: str
-    notion_parent_page_id: str
+    # Everything a fresh clone cannot guess defaults to empty, so the package
+    # imports (and `--help` / `init` work) before a .env exists. Commands that
+    # need them call require_configured() first.
+    notion_token: str = ""
+    notion_parent_page_id: str = ""
     notion_rent_db_id: str = ""
 
     modules_enabled: str = "rent"
 
-    source_zapimoveis_enabled: bool = True
-    source_quintoandar_enabled: bool = True
-
     rent_city: str = "São Paulo"
     rent_state: str = "SP"
-    rent_neighborhoods: str
-    rent_price_min: int
-    rent_price_max: int
+    rent_neighborhoods: str = ""
+    rent_price_min: int = 0
+    rent_price_max: int = 0
     rent_bedrooms_min: int = 2
     rent_bedrooms_max: int = 3
     rent_bathrooms_min: int = 2
@@ -46,8 +50,6 @@ class Settings(BaseSettings):
 
     # Buy module
     notion_buy_db_id: str = ""
-    source_zapimoveis_buy_enabled: bool = True
-    source_quintoandar_buy_enabled: bool = False
 
     buy_city: str = "São Paulo"
     buy_state: str = "SP"
@@ -123,7 +125,7 @@ class Settings(BaseSettings):
     # Buy only — rent never resolves condo data. Off -> unknown years stay.
     condo_age_require_known: bool = True
 
-    work_address: str
+    work_address: str = ""
     work_max_distance_km: float = 5.5
     work_lat: float | None = None
     work_lng: float | None = None
@@ -137,12 +139,11 @@ class Settings(BaseSettings):
     # rate at the source in the same proportion — move it with the delays.
     pool_workers: int = 10
 
-    http_impersonate: str = "chrome146"
+    http_impersonate: str = "chrome124"
     http_min_delay_sec: float = 3.0
     http_max_delay_sec: float = 10.0
     http_max_retries: int = 5
     http_backoff_base_sec: float = 1.0
-    http_playwright_fallback: bool = True
     http_user_agents: str = ""
 
     # Notion's documented average is ~3 requests/second per integration. Writes
@@ -168,6 +169,43 @@ class Settings(BaseSettings):
         if v == "" or v is None:
             return None
         return float(v)
+
+    def missing_config(self, kind: str | None = None) -> list[str]:
+        """Env vars a command cannot run without that are still unset.
+
+        `kind` adds the search vars of one module ("rent" / "buy"); None checks
+        only what every command needs.
+        """
+        missing: list[str] = []
+        if not self.notion_token:
+            missing.append("NOTION_TOKEN")
+        if not self.notion_parent_page_id:
+            missing.append("NOTION_PARENT_PAGE_ID")
+        if not self.work_address and (self.work_lat is None or self.work_lng is None):
+            missing.append("WORK_ADDRESS")
+        if kind == "rent":
+            if not self.neighborhoods_list:
+                missing.append("RENT_NEIGHBORHOODS")
+            if self.rent_price_max <= 0:
+                missing.append("RENT_PRICE_MAX")
+        elif kind == "buy":
+            if not self.buy_neighborhoods_list:
+                missing.append("BUY_NEIGHBORHOODS (or RENT_NEIGHBORHOODS)")
+            if self.buy_price_max <= 0:
+                missing.append("BUY_PRICE_MAX")
+        return missing
+
+    def require_configured(self, kind: str | None = None) -> None:
+        """Raise a readable error when the .env is absent or incomplete."""
+        missing = self.missing_config(kind)
+        if missing:
+            env = ROOT / ".env"
+            where = "" if env.exists() else f" ({env} does not exist)"
+            raise NotConfiguredError(
+                f"rental-finder is not configured{where}: missing "
+                + ", ".join(missing)
+                + ". Run `rental-finder init` to set it up."
+            )
 
     @property
     def neighborhoods_list(self) -> list[str]:

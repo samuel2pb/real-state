@@ -3,7 +3,6 @@ from datetime import date
 from rental_finder.models import Listing, parse_source_date
 from rental_finder.notion_store import NotionStore, _listed_at_props
 from rental_finder.sources.quintoandar import QuintoAndarSource
-from rental_finder.sources.zapimoveis import ZapSource
 
 
 def test_parse_source_date_formats():
@@ -19,52 +18,9 @@ def test_parse_source_date_rejects_garbage():
         assert parse_source_date(bad) is None
 
 
-def _zap_hit(price_key: str) -> dict:
-    return {
-        "listing": {
-            "id": "123",
-            "createdAt": "2025-04-11T18:48:43.502Z",
-            "pricingInfos": [
-                {
-                    "businessType": "RENTAL" if price_key == "rent" else "SALE",
-                    "price": 5000,
-                    "rentalInfo": {"monthlyRentalTotalPrice": 6000},
-                }
-            ],
-            "address": {"neighborhood": "Moema"},
-            "bedrooms": [2],
-            "bathrooms": [2],
-            "suites": [1],
-            "parkingSpaces": [1],
-            "usableAreas": [80],
-            "unitTypes": ["APARTMENT"],
-        },
-        "link": {"href": "/imovel/123/"},
-    }
-
-
-def test_zap_rent_captures_created_at():
-    lst = ZapSource._parse_one(ZapSource.__new__(ZapSource), _zap_hit("rent"), "Moema")
-    assert lst.listed_at == date(2025, 4, 11)
-
-
-def test_zap_buy_captures_created_at():
-    lst = ZapSource._parse_buy_one(
-        ZapSource.__new__(ZapSource), _zap_hit("sale"), "Moema"
-    )
-    assert lst.listed_at == date(2025, 4, 11)
-
-
-def test_zap_missing_created_at_is_none():
-    hit = _zap_hit("rent")
-    del hit["listing"]["createdAt"]
-    lst = ZapSource._parse_one(ZapSource.__new__(ZapSource), hit, "Moema")
-    assert lst.listed_at is None
-
-
 def _mk(**kw) -> Listing:
     base = dict(
-        source="zap",
+        source="quintoandar",
         external_id="1",
         url="http://x",
         neighborhood="Moema",

@@ -6,7 +6,7 @@ from datetime import date, datetime, timezone
 
 @dataclass(slots=True)
 class Listing:
-    source: str  # "zap" | "quintoandar"
+    source: str  # "quintoandar"
     external_id: str  # unique per source
     url: str
     neighborhood: str
@@ -35,11 +35,11 @@ class Listing:
     mode: str = "rent"          # "rent" | "buy"
     price_sale: float = 0.0     # sale price (zero for rent listings)
     condo_fee: float = 0.0      # monthly condo (display only)
-    iptu: float = 0.0           # IPTU as sourced (annual on zap, unknown on qa)
-    # Advertised total area, when the source publishes it separately. Zap sends
-    # usableAreas + totalAreas; QuintoAndar sends one unlabelled `area`, which
-    # is how 141 m2 (unit + two parking spaces) was stored as the unit size of a
-    # ~119 m2 apartment. `sqm_basis` says which of those `sqm` actually is.
+    iptu: float = 0.0           # IPTU as sourced (QuintoAndar houseInfo.iptu; 0 when absent)
+    # Advertised total area, when the source publishes it separately.
+    # QuintoAndar sends one unlabelled `area`, which is how 141 m2 (unit + two
+    # parking spaces) was stored as the unit size of a ~119 m2 apartment.
+    # `sqm_basis` says which of those `sqm` actually is.
     sqm_total: float = 0.0
     sqm_basis: str = ""         # "usable" | "unspecified"
     prev_price: float | None = None      # price recorded before this drop

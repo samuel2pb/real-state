@@ -4,7 +4,7 @@ from rental_finder.pipeline import _matches_filters
 
 def _mk(**over):
     base = dict(
-        source="zap",
+        source="quintoandar",
         external_id="1",
         url="http://x",
         neighborhood="Moema",

@@ -1,3 +1,5 @@
+> ZapImóveis was removed on 2026-11-02 — see PLAN-QUINTOANDAR-ONLY.md. Kept as history.
+
 # Real-Estate Scraper — Implementation Plan
 
 Target: Python scraper for rental listings on zapimoveis.com.br + quintoandar.com.br, pushed to Notion. Runs N×/day. Future: buy, sell, rent-for-others modules.

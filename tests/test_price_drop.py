@@ -10,7 +10,7 @@ DROP_KEYS = ("PrevPrice", "PriceDrop", "PriceDropPct", "PriceChangedAt")
 
 def _mk(kind, price):
     base = dict(
-        source="zap",
+        source="quintoandar",
         external_id="1",
         url="http://x",
         neighborhood="Moema",
@@ -139,7 +139,7 @@ class _RecStore:
 
 
 class _RecSrc:
-    name = "zap"
+    name = "quintoandar"
 
     def __init__(self, res):
         self.res = res
@@ -153,7 +153,7 @@ def _reconcile(recheck_result, stored_price=5000.0, kind="rent"):
         {
             "page_id": "p1",
             "external_id": "E1",
-            "source": "zap",
+            "source": "quintoandar",
             "url": "http://x",
             "neighborhood": "Moema",
             "price": stored_price,
@@ -162,7 +162,7 @@ def _reconcile(recheck_result, stored_price=5000.0, kind="rent"):
     store = _RecStore(rows)
     stats = {"gone": 0, "price_up": 0, "price_drop": 0}
     pipeline._reconcile_alive(
-        store, {"zap": _RecSrc(recheck_result)}, {"zap": set()}, {"zap"}, kind, stats
+        store, {"quintoandar": _RecSrc(recheck_result)}, {"quintoandar": set()}, {"quintoandar"}, kind, stats
     )
     return store.calls, stats
 

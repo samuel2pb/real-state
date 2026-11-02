@@ -1,3 +1,5 @@
+> ZapImóveis was removed on 2026-11-02 — see PLAN-QUINTOANDAR-ONLY.md. Kept as history.
+
 # Extend rental-finder — Sale (Buy) module
 
 Target: add "for sale" ingestion mirroring the existing rent pipeline. Same neighborhoods, same work-distance cap, same sources (zapimoveis + quintoandar), new Notion DB, new env-var group, shared code where safe.

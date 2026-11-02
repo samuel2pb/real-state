@@ -1,4 +1,14 @@
-from rental_finder.config import settings
+import pytest
+
+from rental_finder import config
+
+if not (config.ROOT / ".env").exists():
+    pytest.skip(
+        "no .env (fresh clone); run `rental-finder init` to check real settings",
+        allow_module_level=True,
+    )
+
+settings = config.settings
 
 
 def test_settings_loads():

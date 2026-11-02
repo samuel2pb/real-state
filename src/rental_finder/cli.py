@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import subprocess
 
 import structlog
 import typer
@@ -346,6 +347,7 @@ def condo_golden_cmd(
 @app.command("schedule")
 def schedule() -> None:
     """Start the cron scheduler (blocking)."""
+    settings.require_configured()
     _init_logging()
     from .scheduler import start
     start()
@@ -354,6 +356,7 @@ def schedule() -> None:
 @app.command("geo")
 def geo() -> None:
     """Geocode work address + all neighborhoods (warms cache)."""
+    settings.require_configured()
     _init_logging()
     from .geo import work_coords, neighborhood_bbox
     typer.echo(f"work: {work_coords()}")
@@ -361,8 +364,170 @@ def geo() -> None:
         typer.echo(f"{n}: {neighborhood_bbox(n)}")
 
 
+@app.command("drop-source")
+def drop_source_cmd(
+    source: str = typer.Option(..., help="Source value to remove, e.g. 'zap'"),
+    kind: str = typer.Option(..., help="'rent' or 'buy'"),
+    apply: bool = typer.Option(
+        False, "--apply", help="Actually trash the rows (default: report only)"
+    ),
+    yes: bool = typer.Option(False, "--yes", help="Skip the confirmation prompt"),
+) -> None:
+    """Trash every row of one Source (e.g. the retired 'zap'). Dry run unless --apply.
+
+    Rows go to Notion's trash, recoverable for 30 days.
+    """
+    if kind not in ("rent", "buy"):
+        raise typer.BadParameter("kind must be 'rent' or 'buy'")
+    _init_logging()
+    from .pipeline import drop_source
+
+    if apply and not yes:
+        typer.confirm(
+            f"Trash every {kind} row with Source={source!r}, whatever its status?",
+            abort=True,
+        )
+    stats = drop_source(kind=kind, source=source, apply=apply)
+    typer.echo({"kind": kind, "source": source, "apply": apply, **stats})
+
+
+@app.command("init")
+def init_cmd(
+    force: bool = typer.Option(False, "--force", help="Overwrite an existing .env"),
+    non_interactive: bool = typer.Option(
+        False,
+        "--non-interactive",
+        help="Take every value from the options below (or the .env.example "
+        "default); never prompt",
+    ),
+    create_dbs: bool | None = typer.Option(
+        None,
+        "--create-dbs/--no-create-dbs",
+        help="Create the Notion databases after writing .env "
+        "(default: ask; skipped when non-interactive)",
+    ),
+    notion_token: str | None = typer.Option(None, help="NOTION_TOKEN"),
+    notion_parent_page_id: str | None = typer.Option(
+        None, help="NOTION_PARENT_PAGE_ID (id or page URL)"
+    ),
+    modules: str | None = typer.Option(None, help="MODULES_ENABLED: rent | buy | rent,buy"),
+    rent_neighborhoods: str | None = typer.Option(None, help="RENT_NEIGHBORHOODS"),
+    rent_price_min: int | None = typer.Option(None, help="RENT_PRICE_MIN"),
+    rent_price_max: int | None = typer.Option(None, help="RENT_PRICE_MAX"),
+    rent_bedrooms_min: int | None = typer.Option(None, help="RENT_BEDROOMS_MIN"),
+    rent_bedrooms_max: int | None = typer.Option(None, help="RENT_BEDROOMS_MAX"),
+    buy_neighborhoods: str | None = typer.Option(None, help="BUY_NEIGHBORHOODS"),
+    buy_price_min: int | None = typer.Option(None, help="BUY_PRICE_MIN"),
+    buy_price_max: int | None = typer.Option(None, help="BUY_PRICE_MAX"),
+    work_address: str | None = typer.Option(None, help="WORK_ADDRESS"),
+    work_max_distance_km: float | None = typer.Option(None, help="WORK_MAX_DISTANCE_KM"),
+    schedule_times: str | None = typer.Option(
+        None, help="Run times as HH:MM, comma-separated, e.g. 09:00,18:00"
+    ),
+) -> None:
+    """Guided setup: write .env and (optionally) create the Notion databases."""
+    from .init_wizard import run_init
+
+    given = {
+        "NOTION_TOKEN": notion_token,
+        "NOTION_PARENT_PAGE_ID": notion_parent_page_id,
+        "MODULES_ENABLED": modules,
+        "RENT_NEIGHBORHOODS": rent_neighborhoods,
+        "RENT_PRICE_MIN": rent_price_min,
+        "RENT_PRICE_MAX": rent_price_max,
+        "RENT_BEDROOMS_MIN": rent_bedrooms_min,
+        "RENT_BEDROOMS_MAX": rent_bedrooms_max,
+        "BUY_NEIGHBORHOODS": buy_neighborhoods,
+        "BUY_PRICE_MIN": buy_price_min,
+        "BUY_PRICE_MAX": buy_price_max,
+        "WORK_ADDRESS": work_address,
+        "WORK_MAX_DISTANCE_KM": work_max_distance_km,
+        "SCHEDULE_TIMES": schedule_times,
+    }
+    given = {k: (None if v is None else str(v)) for k, v in given.items()}
+    try:
+        run_init(
+            given,
+            force=force,
+            interactive=not non_interactive,
+            create_dbs=create_dbs,
+        )
+    except (FileExistsError, FileNotFoundError, ValueError) as e:
+        typer.echo(f"init: {e}", err=True)
+        raise typer.Exit(1)
+    typer.echo("Next: `uv run rental-finder doctor`, then `uv run rental-finder run-once`.")
+
+
+@app.command("doctor")
+def doctor_cmd() -> None:
+    """Check the install: .env, Notion token and DB ids, uv / claude on PATH."""
+    from .doctor import has_failures, run_checks
+
+    checks = run_checks()
+    width = max(len(name) for name, _, _ in checks)
+    for name, status, detail in checks:
+        typer.echo(f"{status:<4}  {name:<{width}}  {detail}")
+    if has_failures(checks):
+        raise typer.Exit(1)
+
+
+@app.command("install-scheduler")
+def install_scheduler_cmd(
+    kind: str | None = typer.Option(
+        None, help="rent | buy | both (default: the modules in MODULES_ENABLED)"
+    ),
+    job: str = typer.Option(
+        "run", help="run (the normal cycle) | recheck-gone (pair with a weekly cron)"
+    ),
+    times: str | None = typer.Option(
+        None,
+        help="Daily run times as HH:MM, comma-separated, e.g. 09:00,18:00 "
+        "(default: SCHEDULE_CRON_TIMES)",
+    ),
+    uninstall: bool = typer.Option(
+        False, "--uninstall", help="Remove the entries this command created"
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Print the commands and files; change nothing"
+    ),
+) -> None:
+    """Register the cycle with the OS scheduler (Task Scheduler / launchd / cron)."""
+    from .scheduler_install import (
+        SchedulerError,
+        install,
+        parse_crons,
+        resolve_kinds,
+        triggers_from_times,
+    )
+
+    try:
+        kinds = resolve_kinds(kind, settings.modules_list)
+        triggers = (
+            triggers_from_times(times) if times else parse_crons(settings.cron_list)
+        )
+        done = install(
+            kinds=kinds, job=job, triggers=triggers, uninstall=uninstall, dry_run=dry_run
+        )
+    except SchedulerError as e:
+        typer.echo(f"install-scheduler: {e}", err=True)
+        raise typer.Exit(1)
+    except subprocess.CalledProcessError as e:
+        detail = (e.stderr or e.stdout or "").strip()
+        typer.echo(f"install-scheduler: {' '.join(e.cmd)} failed: {detail}", err=True)
+        raise typer.Exit(1)
+    prefix = "(dry run) would have: " if dry_run else ""
+    for line in done:
+        typer.echo(f"{prefix}{line}")
+
+
 def main() -> None:
-    app()
+    from .config import NotConfiguredError
+
+    try:
+        app()
+    except NotConfiguredError as e:
+        typer.echo(str(e), err=True)
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

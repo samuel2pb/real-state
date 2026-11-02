@@ -78,13 +78,13 @@ class NotionStore:
         if kind == "rent":
             if not settings.notion_rent_db_id:
                 raise RuntimeError(
-                    "NOTION_RENT_DB_ID unset; run scripts/setup_notion.py"
+                    "NOTION_RENT_DB_ID unset; run `rental-finder init`"
                 )
             return settings.notion_rent_db_id
         if kind == "buy":
             if not settings.notion_buy_db_id:
                 raise RuntimeError(
-                    "NOTION_BUY_DB_ID unset; run scripts/setup_notion.py --kind buy"
+                    "NOTION_BUY_DB_ID unset; run `rental-finder init`"
                 )
             return settings.notion_buy_db_id
         raise NotImplementedError(f"db kind {kind!r} not implemented yet")
@@ -524,11 +524,30 @@ class NotionStore:
                     {"property": "Status", "select": {"equals": s}} for s in statuses
                 ]
             }
+        yield from self._query_rows(kind, ds_id, status_filter)
+
+    def list_by_source(self, kind: str, source: str) -> Iterator[dict]:
+        """Every row of the base whose Source is `source`, whatever its Status.
+
+        A base that never had that option 400s the filter; that just means
+        there is nothing to list.
+        """
+        ds_id = self._data_source_id(kind)
+        try:
+            yield from self._query_rows(
+                kind, ds_id, {"property": "Source", "select": {"equals": source}}
+            )
+        except APIResponseError as e:
+            if getattr(e, "status", 0) != 400:
+                raise
+            log.warning("notion_source_filter_rejected", kind=kind, source=source, err=str(e))
+
+    def _query_rows(self, kind: str, ds_id: str, row_filter: dict) -> Iterator[dict]:
         cursor: str | None = None
         while True:
             kw: dict = {
                 "data_source_id": ds_id,
-                "filter": status_filter,
+                "filter": row_filter,
                 "page_size": 100,
             }
             if cursor:
@@ -540,6 +559,7 @@ class NotionStore:
                     "page_id": page["id"],
                     "external_id": _plain(p.get("ExternalID")),
                     "source": (p.get("Source", {}).get("select") or {}).get("name", ""),
+                    "status": (p.get("Status", {}).get("select") or {}).get("name", ""),
                     "url": p.get("URL", {}).get("url", ""),
                     "neighborhood": (p.get("Neighborhood", {}).get("select") or {}).get(
                         "name", ""
@@ -584,10 +604,10 @@ def _listed_at_props(lst: Listing) -> dict:
 def _area_props(lst: Listing) -> dict:
     """What `Sqm` actually measures, and the total when the source splits them.
 
-    Zap publishes usableAreas and totalAreas; QuintoAndar publishes one
-    unlabelled `area`, so its rows say "unspecified" rather than pretending the
-    number is private area. Any R$/m2 built on an "unspecified" row is a floor,
-    not a value: a total-area number understates the real price per square metre.
+    QuintoAndar publishes one unlabelled `area`, so its rows say "unspecified"
+    rather than pretending the number is private area. Any R$/m2 built on an
+    "unspecified" row is a floor, not a value: a total-area number understates
+    the real price per square metre.
     """
     return {
         "SqmTotal": {"number": lst.sqm_total or None},
