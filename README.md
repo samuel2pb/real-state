@@ -106,7 +106,7 @@ independent from rent filters.
 ```bash
 uv run rental-finder install-scheduler                       # modules in MODULES_ENABLED, SCHEDULE_CRON_TIMES
 uv run rental-finder install-scheduler --kind both --times "08:30,19:00"
-uv run rental-finder install-scheduler --job recheck-gone --kind buy --times "07:00"
+uv run rental-finder install-scheduler --job recheck-gone --kind both --cron "0 14 * * SUN"
 uv run rental-finder install-scheduler --dry-run             # print what it would do, change nothing
 uv run rental-finder install-scheduler --uninstall           # remove what it created
 ```

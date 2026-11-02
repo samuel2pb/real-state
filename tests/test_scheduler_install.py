@@ -119,7 +119,7 @@ def test_windows_install_commands(monkeypatch):
     cmds = [c for c, _ in rec.calls]
     assert cmds[0] == ["schtasks", "/Query", "/FO", "CSV", "/NH"]
     tr = (
-        f'cmd /c "cd /d "{root}" && "{UV_WIN}" run rental-finder run-once '
+        f'conhost.exe --headless cmd /c "cd /d "{root}" && "{UV_WIN}" run rental-finder run-once '
         f'>> "logs\\run-rent.log" 2>&1"'
     )
     assert cmds[1] == [

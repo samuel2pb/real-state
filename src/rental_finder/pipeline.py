@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import re
 import threading
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 
@@ -142,6 +144,13 @@ def _enrich_and_filter(
 ) -> bool:
     """Detail fetch + distance + filters. True when the listing earns a row."""
     src.enrich(lst)
+    return _passes_gate(lst, work, matches, kind)
+
+
+def _passes_gate(
+    lst: Listing, work: tuple[float, float], matches: callable, kind: str
+) -> bool:
+    """Distance cap + matcher on an already-enriched listing."""
     _annotate_distance(lst, work)
     if (
         lst.distance_km is not None
@@ -338,6 +347,12 @@ def _reconcile_alive(
             with stats_lock:
                 stats["price_drop"] += 1
             log.info("marked_price_down", id=f"{src_name}:{alive['external_id']}", price=price)
+        elif alive_flag and price:
+            # Published and in band, just not in search (a truncated price
+            # bucket, a classified under the wrong route). Marking it gone would
+            # undo what recheck_gone revived. Unknown price stays gone below.
+            store.touch_alive(alive["page_id"])
+            log.info("alive_not_in_search", id=f"{src_name}:{alive['external_id']}", price=price)
         else:
             store.mark_gone(alive["page_id"])
             with stats_lock:
@@ -760,44 +775,247 @@ def backfill_listed_at(kind: str = "rent", include_gone: bool = True) -> dict:
     return stats
 
 
-def recheck_gone(kind: str = "rent") -> dict:
-    """Re-examine listings already marked gone; promote true price-up ones.
+_TYPE_ALIASES = {
+    "apartment": {"apartamento", "apartment"},
+    "house": {"casa", "home"},
+    "condo_house": {"casacondominio", "casadecondominio", "condominium"},
+}
 
-    Live + current price > max -> mark_price_up. Else leave gone.
-    Intended as an occasional backfill, NOT called automatically from run cycles.
+
+def _norm_type(value: str) -> str:
+    nfkd = unicodedata.normalize("NFKD", value or "")
+    return re.sub(r"[^a-z0-9]", "", nfkd.encode("ascii", "ignore").decode().lower())
+
+
+def _type_allowed(lst: Listing, kind: str) -> bool:
+    """Property type against RENT/BUY_PROPERTY_TYPES.
+
+    A cycle never needs this: the type is a search parameter, so a hit of the
+    wrong type is never returned. A listing rebuilt from its detail page skips
+    the search, so the gone sweep has to ask. Unknown type passes.
     """
-    settings.require_configured(kind)
-    store = NotionStore()
-    store.ensure_columns(kind)
-    sources = enabled_sources(mode=kind)
-    src_by_name = {s.name: s for s in sources}
+    raw = settings.buy_property_types if kind == "buy" else settings.rent_property_types
+    wanted: set[str] = set()
+    for t in raw.split(","):
+        wanted |= _TYPE_ALIASES.get(t.strip(), set())
+    if not wanted or not lst.property_type:
+        return True
+    return _norm_type(lst.property_type) in wanted
+
+
+def _price_band(price: float | None, kind: str) -> str:
+    """'up' above the max, 'down' below the min, '' in band or unknown."""
     pmax = settings.buy_price_max if kind == "buy" else settings.rent_price_max
     pmin = settings.buy_price_min if kind == "buy" else settings.rent_price_min
-    stats = {"examined": 0, "price_up": 0, "price_drop": 0, "skipped": 0}
+    if price is None:
+        return ""
+    if price > pmax:
+        return "up"
+    if 0 < price < pmin:
+        return "down"
+    return ""
 
-    for gone in store.list_gone(kind=kind):
-        stats["examined"] += 1
-        src_name = gone["source"]
-        src = src_by_name.get(src_name)
-        if src is None:
-            stats["skipped"] += 1
-            continue
-        alive_flag, price = src.recheck(
-            external_id=gone["external_id"], url=gone["url"], kind=kind
-        )
-        if alive_flag and price is not None and price > pmax:
+
+def recheck_gone(kind: str = "rent") -> dict:
+    """Weekly sweep over gone rows: put back the ones that are live again.
+
+    A cycle only revives a gone row when search returns it again. One that is
+    live but never resurfaces (a truncated price bucket, a classified stored
+    under the wrong route) stays gone for good. Here each gone row is fetched
+    on its own and, when the ad is published, run through the gate a search
+    hit gets: price band, property type, distance + matcher, then _finalize
+    (condo lookup + age gate + upsert). A pass goes back to available with
+    LastSeen=today; a filter reject stays gone; an age reject is trashed,
+    exactly as a cycle would. Live but out of the price band -> price-up /
+    price-drop, as before.
+
+    Sources with no single-listing fetch keep the price-only recheck: without
+    the full listing the filters cannot be applied, so they never revive.
+    """
+    settings.require_configured(kind)
+    work = work_coords()
+    store = NotionStore()
+    store.ensure_columns(kind)
+    store.prime_index(kind)
+    if kind == "buy":
+        reset_run_budget()
+    today = date.today()
+    src_by_name = {s.name: s for s in enabled_sources(mode=kind)}
+    matches = _matches_buy_filters if kind == "buy" else _matches_filters
+    stats = {
+        "examined": 0,
+        "revived": 0,
+        "price_up": 0,
+        "price_drop": 0,
+        "still_gone": 0,
+        "rejected": 0,
+        "aged_out": 0,
+        "age_unknown": 0,
+        "skipped": 0,
+        "duplicates": 0,
+        "errors": 0,
+    }
+    stats_lock = threading.Lock()
+
+    def _bump(key: str) -> None:
+        with stats_lock:
+            stats[key] += 1
+
+    def _mark_band(gone: dict, band: str, price: float) -> None:
+        gid = f"{gone['source']}:{gone['external_id']}"
+        if band == "up":
             store.mark_price_up(gone["page_id"], kind=kind, price=price)
-            stats["price_up"] += 1
-            log.info("recheck_priceup", id=f"{src_name}:{gone['external_id']}", price=price)
-        elif alive_flag and price is not None and 0 < price < pmin:
+            _bump("price_up")
+            log.info("recheck_priceup", id=gid, price=price)
+        else:
             store.mark_price_down(
                 gone["page_id"], kind=kind, price=price, prev_price=gone.get("price")
             )
-            stats["price_drop"] += 1
-            log.info("recheck_pricedown", id=f"{src_name}:{gone['external_id']}", price=price)
-        else:
-            stats["skipped"] += 1
+            _bump("price_drop")
+            log.info("recheck_pricedown", id=gid, price=price)
 
+    final_futures: list = []
+    final_lock = threading.Lock()
+
+    # Same two-pool split as _run_source: a condo lookup runs for minutes and
+    # must not hold a worker the detail fetches are queued behind.
+    with ThreadPoolExecutor(max_workers=settings.pool_workers) as pool:
+        with ThreadPoolExecutor(max_workers=settings.condo_pool_size) as condo_pool:
+
+            def _job(gone: dict) -> None:
+                src = src_by_name.get(gone["source"])
+                if src is None:
+                    _bump("skipped")
+                    return
+                if not src.can_fetch_listing:
+                    alive_flag, price = src.recheck(
+                        external_id=gone["external_id"], url=gone["url"], kind=kind
+                    )
+                    band = _price_band(price, kind) if alive_flag else ""
+                    if band:
+                        _mark_band(gone, band, price)
+                    else:
+                        _bump("skipped")
+                    return
+                lst = src.fetch_listing(
+                    external_id=gone["external_id"],
+                    url=gone["url"],
+                    kind=kind,
+                    neighborhood=gone.get("neighborhood") or "",
+                )
+                if lst is None:
+                    _bump("still_gone")
+                    return
+                price = lst.price_sale if kind == "buy" else lst.price_total
+                band = _price_band(price, kind)
+                if band:
+                    _mark_band(gone, band, price)
+                    return
+                if not _type_allowed(lst, kind):
+                    log.info(
+                        "recheck_reject", id=lst.global_id, why="type", v=lst.property_type
+                    )
+                    _bump("rejected")
+                    return
+                if not _passes_gate(lst, work, matches, kind):
+                    log.info("recheck_reject", id=lst.global_id, why="filters")
+                    _bump("rejected")
+                    return
+                target = condo_pool if _wants_condo(lst, kind) else pool
+                fut = target.submit(_finalize, lst, store, today, kind)
+                with final_lock:
+                    final_futures.append(fut)
+
+            # Two rows can carry one listing (see dedupe_rows). Both would upsert
+            # into the same page via the index, counting one revival twice and
+            # leaving the other row gone, so each listing is checked once.
+            rows: list[dict] = []
+            seen_keys: set[tuple[str, str]] = set()
+            for row in store.list_gone(kind=kind):
+                key = (row["source"], row["external_id"])
+                if key in seen_keys:
+                    stats["duplicates"] += 1
+                    continue
+                seen_keys.add(key)
+                rows.append(row)
+            stats["examined"] = len(rows)
+            futures = [pool.submit(_job, row) for row in rows]
+            for fut in as_completed(futures):
+                try:
+                    fut.result()
+                except Exception as e:
+                    _bump("errors")
+                    log.error("recheck_gone_error", kind=kind, err=str(e))
+    # Both pools are drained once the `with` blocks unwind, so every finalize
+    # future below is already resolved.
+    for fut in final_futures:
+        try:
+            upserted, _, reason = fut.result()
+        except Exception as e:
+            stats["errors"] += 1
+            log.error("recheck_gone_error", kind=kind, err=str(e))
+            continue
+        if upserted:
+            stats["revived"] += 1
+        elif reason == "age":
+            stats["aged_out"] += 1
+        elif reason == "age_unknown":
+            stats["age_unknown"] += 1
+    return stats
+
+
+_STATUS_RANK = {"available": 0, "price-drop": 1, "price-up": 2, "gone": 3}
+
+
+def _pick_keeper(rows: list[dict]) -> dict:
+    """The row a duplicate group collapses into.
+
+    Most alive status first, then the most recent LastSeen (the row the cycles
+    have been updating), then the oldest row as the tie-break.
+    """
+    return sorted(
+        rows,
+        key=lambda r: (
+            _STATUS_RANK.get(r["status"], 9),
+            # newest LastSeen first: invert by sorting on the negated ordinal
+            -date.fromisoformat(r["last_seen"][:10]).toordinal()
+            if r["last_seen"]
+            else 0,
+            r["created"],
+        ),
+    )[0]
+
+
+def dedupe_rows(kind: str = "rent", apply: bool = False) -> dict:
+    """Collapse rows that share (source, external_id) into one.
+
+    Keeps the row _pick_keeper chooses, moves the earliest FirstSeen onto it so
+    AvailabilityDays still counts from the first sighting, and trashes the rest
+    (recoverable for 30 days). Dry run unless apply.
+    """
+    store = NotionStore()
+    groups = store.duplicate_groups(kind)
+    stats = {"groups": len(groups), "trashed": 0, "first_seen_moved": 0}
+    for rows in groups:
+        keep = _pick_keeper(rows)
+        drop = [r for r in rows if r["page_id"] != keep["page_id"]]
+        firsts = [r["first_seen"] for r in rows if r["first_seen"]]
+        earliest = min(firsts) if firsts else ""
+        log.info(
+            "dedupe_group",
+            id=f"{kind}:{keep['source']}:{keep['external_id']}",
+            keep=f"{keep['page_id']} ({keep['status']})",
+            drop=[f"{r['page_id']} ({r['status']})" for r in drop],
+            apply=apply,
+        )
+        if not apply:
+            continue
+        if earliest and earliest != keep["first_seen"]:
+            store.set_first_seen(keep["page_id"], earliest)
+            stats["first_seen_moved"] += 1
+        for r in drop:
+            store.archive_page(r["page_id"])
+            stats["trashed"] += 1
     return stats
 
 

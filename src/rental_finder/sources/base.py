@@ -9,6 +9,8 @@ from ..models import Listing
 
 class Source(ABC):
     name: str
+    # True when fetch_listing() can rebuild a full Listing from an ID alone.
+    can_fetch_listing: bool = False
 
     @abstractmethod
     def search_rent(self, neighborhoods: list[str]) -> Iterator[Listing]: ...
@@ -29,6 +31,17 @@ class Source(ABC):
         """Publication date of an already-stored listing, for backfill.
 
         Default: unknown. Sources that expose a date implement this.
+        """
+        return None
+
+    def fetch_listing(
+        self, *, external_id: str, url: str, kind: str, neighborhood: str = ""
+    ) -> Listing | None:
+        """Rebuild a stored listing from its detail page, for the gone sweep.
+
+        Returns a Listing populated as fully as a search hit plus enrich would
+        leave it, or None when the ad is not published any more. Only meaningful
+        when can_fetch_listing is True.
         """
         return None
 

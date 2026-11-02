@@ -45,7 +45,10 @@ def run_buy_once() -> None:
 def recheck_gone_cmd(
     kind: str = typer.Option("both", help="'rent', 'buy', or 'both'"),
 ) -> None:
-    """Re-examine gone listings; promote price-up ones. Occasional backfill only."""
+    """Revive gone listings that are live again and still pass every filter.
+
+    Scheduled weekly (scripts/rental-finder-recheck-gone.xml).
+    """
     _init_logging()
     if kind in ("rent", "both"):
         stats = recheck_gone(kind="rent")
@@ -53,6 +56,28 @@ def recheck_gone_cmd(
     if kind in ("buy", "both"):
         stats = recheck_gone(kind="buy")
         typer.echo({"kind": "buy", **stats})
+
+
+@app.command("dedupe-rows")
+def dedupe_rows_cmd(
+    kind: str = typer.Option("both", help="'rent', 'buy', or 'both'"),
+    apply: bool = typer.Option(
+        False, "--apply", help="Actually trash the extra rows (default: report only)"
+    ),
+    yes: bool = typer.Option(False, "--yes", help="Skip the confirmation prompt"),
+) -> None:
+    """Find rows sharing one listing ID; keep one, trash the rest. Dry run unless --apply.
+
+    Trashed rows are recoverable from Notion's trash for 30 days.
+    """
+    _init_logging()
+    from .pipeline import dedupe_rows
+
+    if apply and not yes:
+        typer.confirm(f"Trash duplicate rows in {kind}?", abort=True)
+    for k in ("rent", "buy"):
+        if kind in (k, "both"):
+            typer.echo({"kind": k, "apply": apply, **dedupe_rows(kind=k, apply=apply)})
 
 
 @app.command("listed-at-backfill")
@@ -484,6 +509,11 @@ def install_scheduler_cmd(
         help="Daily run times as HH:MM, comma-separated, e.g. 09:00,18:00 "
         "(default: SCHEDULE_CRON_TIMES)",
     ),
+    cron: str | None = typer.Option(
+        None,
+        help="Cron expressions, comma-separated, for weekly runs, e.g. '0 14 * * SUN' "
+        "(replaces --times)",
+    ),
     uninstall: bool = typer.Option(
         False, "--uninstall", help="Remove the entries this command created"
     ),
@@ -502,9 +532,12 @@ def install_scheduler_cmd(
 
     try:
         kinds = resolve_kinds(kind, settings.modules_list)
-        triggers = (
-            triggers_from_times(times) if times else parse_crons(settings.cron_list)
-        )
+        if cron:
+            triggers = parse_crons(cron.split(","))
+        elif times:
+            triggers = triggers_from_times(times)
+        else:
+            triggers = parse_crons(settings.cron_list)
         done = install(
             kinds=kinds, job=job, triggers=triggers, uninstall=uninstall, dry_run=dry_run
         )

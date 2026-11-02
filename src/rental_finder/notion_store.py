@@ -511,6 +511,51 @@ class NotionStore:
             return
         _retry(self.client.pages.update, page_id=page_id, properties=props)
 
+    def duplicate_groups(self, kind: str) -> list[list[dict]]:
+        """Every (source, external_id) held by more than one row in this base.
+
+        Each row: page_id, source, external_id, status, first_seen, last_seen,
+        created (Notion created_time). Dates are ISO strings or "".
+        """
+        ds_id = self._data_source_id(kind)
+        groups: dict[tuple[str, str], list[dict]] = {}
+        cursor: str | None = None
+        while True:
+            kw: dict = {"data_source_id": ds_id, "page_size": 100}
+            if cursor:
+                kw["start_cursor"] = cursor
+            r = _retry(self.client.data_sources.query, **kw)
+            for page in r.get("results") or []:
+                p = page.get("properties") or {}
+                ext = _plain(p.get("ExternalID"))
+                if not ext:
+                    continue
+                src = (p.get("Source", {}).get("select") or {}).get("name", "")
+                groups.setdefault((src, ext), []).append(
+                    {
+                        "page_id": page["id"],
+                        "source": src,
+                        "external_id": ext,
+                        "status": ((p.get("Status") or {}).get("select") or {}).get(
+                            "name", ""
+                        ),
+                        "first_seen": _date_start(p.get("FirstSeen")),
+                        "last_seen": _date_start(p.get("LastSeen")),
+                        "created": page.get("created_time") or "",
+                    }
+                )
+            if not r.get("has_more"):
+                break
+            cursor = r.get("next_cursor")
+        return [rows for rows in groups.values() if len(rows) > 1]
+
+    def set_first_seen(self, page_id: str, iso: str) -> None:
+        _retry(
+            self.client.pages.update,
+            page_id=page_id,
+            properties={"FirstSeen": {"date": {"start": iso}}},
+        )
+
     def _list_by_status(self, kind: str, statuses: list[str]) -> Iterator[dict]:
         ds_id = self._data_source_id(kind)
         if len(statuses) == 1:
@@ -641,6 +686,10 @@ def _condo_props(lst: Listing) -> dict:
         if lst.condo_confidence
         else {"select": None},
     }
+
+
+def _date_start(prop: dict | None) -> str:
+    return ((prop or {}).get("date") or {}).get("start") or ""
 
 
 def _plain(rt_prop: dict | None) -> str:

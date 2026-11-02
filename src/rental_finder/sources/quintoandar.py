@@ -28,6 +28,18 @@ _PROPERTY_TYPE_MAP = {
 }
 
 
+def _num(value: Any) -> float:
+    """Detail numbers arrive as int, float, numeric string or "" on a shell."""
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _int(value: Any) -> int:
+    return int(_num(value))
+
+
 def _slugify(text: str) -> str:
     """Convert 'Vila Nova Conceição' → 'vila-nova-conceicao'."""
     nfkd = unicodedata.normalize("NFKD", text)
@@ -37,6 +49,7 @@ def _slugify(text: str) -> str:
 
 class QuintoAndarSource(Source):
     name = "quintoandar"
+    can_fetch_listing = True
 
     def __init__(self) -> None:
         self.http = CurlSession(
@@ -330,6 +343,9 @@ class QuintoAndarSource(Source):
         detail = self._fetch_detail(lst.external_id, lst.url)
         if not detail:
             return
+        self._apply_rent_detail(lst, detail)
+
+    def _apply_rent_detail(self, lst: Listing, detail: dict[str, Any]) -> None:
         markers = detail.get("markers") or {}
         if markers.get("lat") and markers.get("lng"):
             lst.lat = float(markers["lat"])
@@ -673,6 +689,9 @@ class QuintoAndarSource(Source):
         detail = self._fetch_buy_detail(lst.external_id, lst.url)
         if not detail:
             return
+        self._apply_buy_detail(lst, detail)
+
+    def _apply_buy_detail(self, lst: Listing, detail: dict[str, Any]) -> None:
         markers = detail.get("markers") or {}
         if markers.get("lat") and markers.get("lng"):
             lst.lat = float(markers["lat"])
@@ -700,35 +719,136 @@ class QuintoAndarSource(Source):
         else:
             self._enrich_rent(lst)
 
+    def _published(self, hi: dict[str, Any], kind: str) -> bool:
+        """Is the ad live for this business context?
+
+        A dead ad still serves a house payload — an unhydrated shell with every
+        number zeroed and no listings[] — so a non-empty dict proves nothing.
+        listings[] carries one status per context (a SALE ad can sit beside an
+        unpublished RENT one); the whole-property status is only the fallback.
+        """
+        want = self._BUSINESS_CONTEXT.get(kind, "RENT")
+        entries = hi.get("listings") or []
+        if entries:
+            return any(
+                e.get("businessContext") == want
+                and (e.get("status") or "").lower() == self._PUBLISHED_STATUS
+                for e in entries
+            )
+        return (str(hi.get("status") or "")).lower() == self._PUBLISHED_STATUS
+
+    def _listing_from_detail(
+        self,
+        hid: str,
+        url: str,
+        detail: dict[str, Any],
+        kind: str,
+        neighborhood: str,
+    ) -> Listing | None:
+        """Build the Listing a search hit + enrich would have produced."""
+        hi = detail.get("houseInfo") or {}
+        addr = hi.get("address") if isinstance(hi.get("address"), dict) else {}
+        nb = (
+            neighborhood
+            or addr.get("neighborhood")
+            or (hi.get("region") or {}).get("name")
+            or ""
+        )
+        street = addr.get("street") or ""
+        common = dict(
+            source=self.name,
+            external_id=hid,
+            url=url,
+            neighborhood=nb,
+            bedrooms=_int(hi.get("bedrooms")),
+            bathrooms=_int(hi.get("bathrooms")),
+            suites=0,
+            parking=_int(hi.get("parkingSpaces")),
+            sqm=_num(hi.get("area")),
+            sqm_basis="unspecified",
+            pets=False,
+            furnished=None,
+            lat=None,
+            lng=None,
+            property_type=str(hi.get("type") or ""),
+            address=f"{street}, {nb}" if street else nb,
+        )
+        if kind == "buy":
+            sale = _num(hi.get("salePrice") or detail.get("salePrice"))
+            if sale <= 0:
+                return None
+            lst = Listing(
+                mode="buy",
+                price_rent=0.0,
+                price_total=sale,
+                price_sale=sale,
+                pets_known=hi.get("acceptsPets") is not None,
+                **common,
+            )
+            self._apply_buy_detail(lst, detail)
+            return lst
+        rent = _num(hi.get("rentPrice"))
+        if rent <= 0:
+            return None
+        lst = Listing(
+            price_rent=rent,
+            price_total=_num(hi.get("totalCost")) or rent,
+            **common,
+        )
+        self._apply_rent_detail(lst, detail)
+        return lst
+
+    def fetch_listing(
+        self, *, external_id: str, url: str, kind: str, neighborhood: str = ""
+    ) -> Listing | None:
+        # Stored URL first, then its own/classified counterpart: a row written
+        # before classifieds were routed right points at the /imovel shell.
+        for candidate in self._listed_at_urls(external_id, url, kind):
+            detail = (
+                self._fetch_buy_detail(external_id, candidate)
+                if kind == "buy"
+                else self._fetch_detail(external_id, candidate)
+            )
+            hi = (detail or {}).get("houseInfo") or {}
+            if not hi or not self._published(hi, kind):
+                continue
+            lst = self._listing_from_detail(
+                external_id, candidate, detail, kind, neighborhood
+            )
+            if lst is not None:
+                return lst
+        return None
+
     def recheck(self, *, external_id: str, url: str, kind: str) -> tuple[bool, float | None]:
         """Re-fetch a single listing to distinguish truly-gone vs price-up."""
-        detail = (
-            self._fetch_buy_detail(external_id, url)
-            if kind == "buy"
-            else self._fetch_detail(external_id, url)
-        )
-        if not detail:
-            return (False, None)
-        if kind == "buy":
-            # detail is the top-level house state dict; salePrice lives at the top
-            # level (same key as in buy search hits: raw.get("salePrice")).
-            # Fall back to houseInfo.salePrice if absent.
-            hi = detail.get("houseInfo") or {}
-            raw_price = detail.get("salePrice") or hi.get("salePrice") or 0
-            price: float | None = float(raw_price) if raw_price else None
-        else:
-            # rent: totalCost (rent+condo+iptu) with fallback to rentPrice,
-            # mirroring _parse_search_hit. Also check houseInfo for enriched total.
-            hi = detail.get("houseInfo") or {}
-            raw_price = (
-                detail.get("totalCost")
-                or detail.get("rentPrice")
-                or hi.get("totalCost")
-                or hi.get("rentPrice")
-                or 0
+        # Same routes and published check as fetch_listing: a dead ad still serves
+        # a house payload, so a non-empty detail does not mean alive.
+        for candidate in self._listed_at_urls(external_id, url, kind):
+            detail = (
+                self._fetch_buy_detail(external_id, candidate)
+                if kind == "buy"
+                else self._fetch_detail(external_id, candidate)
             )
-            price = float(raw_price) if raw_price else None
-        return (True, price)
+            hi = (detail or {}).get("houseInfo") or {}
+            if not hi or not self._published(hi, kind):
+                continue
+            if kind == "buy":
+                # detail is the top-level house state dict; salePrice lives at the top
+                # level (same key as in buy search hits: raw.get("salePrice")).
+                # Fall back to houseInfo.salePrice if absent.
+                raw_price = detail.get("salePrice") or hi.get("salePrice") or 0
+            else:
+                # rent: totalCost (rent+condo+iptu) with fallback to rentPrice,
+                # mirroring _parse_search_hit. Also check houseInfo for enriched total.
+                raw_price = (
+                    detail.get("totalCost")
+                    or detail.get("rentPrice")
+                    or hi.get("totalCost")
+                    or hi.get("rentPrice")
+                    or 0
+                )
+            return (True, float(raw_price) if raw_price else None)
+        return (False, None)
 
     def check_alive(self, listing: Listing) -> bool:
         try:

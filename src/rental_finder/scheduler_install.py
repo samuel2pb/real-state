@@ -213,6 +213,10 @@ def windows_task_name(job: str, kind: str, t: Trigger) -> str:
 def windows_tr(uv: str, root: str, job: str, kind: str) -> str:
     """The /TR value: cmd /c, cd into the repo, run, append to the log.
 
+    `conhost --headless` hosts the console without a window. A task logged on
+    interactively otherwise opens an empty one (all output goes to the log), and
+    closing it kills the run with 0xC000013A.
+
     `cd /d` + a relative log path instead of `--directory <root>` + an absolute
     log: the repo path would otherwise appear twice and blow schtasks' 261-char
     limit on a deep checkout. The outer quotes are cmd's: with more than two
@@ -221,7 +225,7 @@ def windows_tr(uv: str, root: str, job: str, kind: str) -> str:
     sub = " ".join(subcommand(job, kind))
     log = f"logs\\{job_name(job, kind)}.log"
     inner = f'cd /d "{root}" && "{uv}" run rental-finder {sub} >> "{log}" 2>&1'
-    tr = f'cmd /c "{inner}"'
+    tr = f'conhost.exe --headless cmd /c "{inner}"'
     if len(tr) > SCHTASKS_TR_MAX:
         raise SchedulerError(
             f"the task command is {len(tr)} chars, over schtasks' {SCHTASKS_TR_MAX} "

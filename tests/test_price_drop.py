@@ -189,3 +189,14 @@ def test_reconcile_buy_below_min_is_price_down():
 def test_reconcile_dead_is_gone():
     calls, stats = _reconcile((False, None))
     assert calls[0][0] == "gone" and stats["gone"] == 1
+
+
+def test_reconcile_live_in_band_stays_alive():
+    pmin = pipeline.settings.rent_price_min
+    calls, stats = _reconcile((True, pmin + 1.0))
+    assert calls == [("touch", "p1")] and stats["gone"] == 0
+
+
+def test_reconcile_live_unknown_price_is_gone():
+    calls, stats = _reconcile((True, None))
+    assert calls[0][0] == "gone" and stats["gone"] == 1
