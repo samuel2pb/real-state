@@ -113,7 +113,7 @@ uv run rental-finder install-scheduler --uninstall           # remove what it cr
 
 | OS | What it creates |
 |---|---|
-| Windows | One Task Scheduler task per time, in the `RentalFinder` folder (`run-rent-0900`, ...). Runs while you are logged in. |
+| Windows | One Task Scheduler task per time, in the `RentalFinder` folder (`run-rent-0900`, ...). Runs while you are logged in, in a console window that shows the output live (`scripts\run-task.ps1`; closing it stops the run). `--hidden` runs without a window. |
 | macOS | `~/Library/LaunchAgents/com.rental-finder.<job>-<kind>.plist`, loaded with `launchctl bootstrap`. |
 | Linux | `crontab` lines tagged `# rental-finder:<job>-<kind>`; re-running replaces them. |
 

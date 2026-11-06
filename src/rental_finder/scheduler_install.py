@@ -210,12 +210,17 @@ def windows_task_name(job: str, kind: str, t: Trigger) -> str:
     return f"{TASK_FOLDER}\\{job_name(job, kind)}-{when}"
 
 
-def windows_tr(uv: str, root: str, job: str, kind: str) -> str:
-    """The /TR value: cmd /c, cd into the repo, run, append to the log.
+def windows_tr(uv: str, root: str, job: str, kind: str, *, window: bool = True) -> str:
+    """The /TR value for one job/kind.
 
-    `conhost --headless` hosts the console without a window. A task logged on
-    interactively otherwise opens an empty one (all output goes to the log), and
-    closing it kills the run with 0xC000013A.
+    With a window (default): `scripts\\run-task.ps1` runs the cycle in a console
+    that shows the output live and tees it into the log. Closing that window
+    stops the run.
+
+    Without (`window=False`): cmd /c, cd into the repo, run, append to the log,
+    under `conhost --headless` so no window opens at all. A plain cmd would open
+    an empty one (all output goes to the log), and closing it kills the run with
+    0xC000013A.
 
     `cd /d` + a relative log path instead of `--directory <root>` + an absolute
     log: the repo path would otherwise appear twice and blow schtasks' 261-char
@@ -224,8 +229,15 @@ def windows_tr(uv: str, root: str, job: str, kind: str) -> str:
     """
     sub = " ".join(subcommand(job, kind))
     log = f"logs\\{job_name(job, kind)}.log"
-    inner = f'cd /d "{root}" && "{uv}" run rental-finder {sub} >> "{log}" 2>&1'
-    tr = f'conhost.exe --headless cmd /c "{inner}"'
+    if window:
+        script = PureWindowsPath(root) / "scripts" / "run-task.ps1"
+        tr = (
+            f'powershell -NoProfile -ExecutionPolicy Bypass -File "{script}" '
+            f'-Uv "{uv}" -Log "{log}" -Run "{sub}"'
+        )
+    else:
+        inner = f'cd /d "{root}" && "{uv}" run rental-finder {sub} >> "{log}" 2>&1'
+        tr = f'conhost.exe --headless cmd /c "{inner}"'
     if len(tr) > SCHTASKS_TR_MAX:
         raise SchedulerError(
             f"the task command is {len(tr)} chars, over schtasks' {SCHTASKS_TR_MAX} "
@@ -260,7 +272,7 @@ def windows_existing(query_stdout: str, job: str, kind: str) -> list[str]:
     return out
 
 
-def _windows(job, kind, triggers, uv, root, *, uninstall, dry_run) -> list[str]:
+def _windows(job, kind, triggers, uv, root, *, uninstall, dry_run, window) -> list[str]:
     done: list[str] = []
     query = _run(["schtasks", "/Query", "/FO", "CSV", "/NH"], dry_run, check=False)
     for name in windows_existing(query.stdout or "", job, kind):
@@ -268,7 +280,7 @@ def _windows(job, kind, triggers, uv, root, *, uninstall, dry_run) -> list[str]:
         done.append(f"removed task {name}")
     if uninstall:
         return done
-    tr = windows_tr(uv, root, job, kind)
+    tr = windows_tr(uv, root, job, kind, window=window)
     for t in triggers:
         name = windows_task_name(job, kind, t)
         _run(windows_create_cmd(name, t, tr), dry_run)
@@ -384,6 +396,7 @@ def install(
     triggers: list[Trigger],
     uninstall: bool = False,
     dry_run: bool = False,
+    window: bool = True,
     os_name: str | None = None,
     root: Path | str = ROOT,
     which: Callable[[str], str | None] = shutil.which,
@@ -391,7 +404,10 @@ def install(
     uid: int | None = None,
     path_env: str | None = None,
 ) -> list[str]:
-    """Install (or remove) one OS schedule entry set per kind. Returns a summary."""
+    """Install (or remove) one OS schedule entry set per kind. Returns a summary.
+
+    `window` only matters on Windows: show each run in a console (see `windows_tr`).
+    """
     os_name = os_name or platform.system()
     if job not in JOBS:
         raise SchedulerError(f"--job must be one of {', '.join(JOBS)} (got {job!r})")
@@ -408,7 +424,10 @@ def install(
     done: list[str] = []
     for kind in kinds:
         if os_name == "Windows":
-            done += _windows(job, kind, triggers, uv, root, uninstall=uninstall, dry_run=dry_run)
+            done += _windows(
+                job, kind, triggers, uv, root,
+                uninstall=uninstall, dry_run=dry_run, window=window,
+            )
         elif os_name == "Darwin":
             done += _macos(
                 job, kind, triggers, uv, root,

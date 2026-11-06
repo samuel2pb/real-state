@@ -520,6 +520,11 @@ def install_scheduler_cmd(
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Print the commands and files; change nothing"
     ),
+    hidden: bool = typer.Option(
+        False,
+        "--hidden",
+        help="Windows: run without a console window (output only in the log)",
+    ),
 ) -> None:
     """Register the cycle with the OS scheduler (Task Scheduler / launchd / cron)."""
     from .scheduler_install import (
@@ -539,7 +544,8 @@ def install_scheduler_cmd(
         else:
             triggers = parse_crons(settings.cron_list)
         done = install(
-            kinds=kinds, job=job, triggers=triggers, uninstall=uninstall, dry_run=dry_run
+            kinds=kinds, job=job, triggers=triggers, uninstall=uninstall, dry_run=dry_run,
+            window=not hidden,
         )
     except SchedulerError as e:
         typer.echo(f"install-scheduler: {e}", err=True)

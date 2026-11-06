@@ -119,8 +119,8 @@ def test_windows_install_commands(monkeypatch):
     cmds = [c for c, _ in rec.calls]
     assert cmds[0] == ["schtasks", "/Query", "/FO", "CSV", "/NH"]
     tr = (
-        f'conhost.exe --headless cmd /c "cd /d "{root}" && "{UV_WIN}" run rental-finder run-once '
-        f'>> "logs\\run-rent.log" 2>&1"'
+        f'powershell -NoProfile -ExecutionPolicy Bypass -File "{root}\\scripts\\run-task.ps1" '
+        f'-Uv "{UV_WIN}" -Log "logs\\run-rent.log" -Run "run-once"'
     )
     assert cmds[1] == [
         "schtasks", "/Create", "/F", "/TN", r"RentalFinder\run-rent-0900",
@@ -138,13 +138,30 @@ def test_windows_install_commands(monkeypatch):
 
 def test_windows_recheck_gone_command():
     tr = si.windows_tr(UV_WIN, r"C:\rf", "recheck-gone", "buy")
-    assert "rental-finder recheck-gone --kind buy" in tr
-    assert r'"logs\recheck-gone-buy.log"' in tr
+    assert '-Run "recheck-gone --kind buy"' in tr
+    assert r'-Log "logs\recheck-gone-buy.log"' in tr
 
 
-def test_windows_tr_too_long():
+def test_windows_hidden_command():
+    root = r"C:\Users\me\rental finder"
+    tr = si.windows_tr(UV_WIN, root, "run", "rent", window=False)
+    assert tr == (
+        f'conhost.exe --headless cmd /c "cd /d "{root}" && "{UV_WIN}" run rental-finder run-once '
+        f'>> "logs\\run-rent.log" 2>&1"'
+    )
+
+
+def test_windows_commands_fit_this_checkout():
+    # The longest job/kind on a typical install path must stay under schtasks' limit.
+    root = r"C:\Users\someone.long\rental-finder"
+    for window in (True, False):
+        assert len(si.windows_tr(UV_WIN, root, "recheck-gone", "rent", window=window)) <= 261
+
+
+@pytest.mark.parametrize("window", [True, False])
+def test_windows_tr_too_long(window):
     with pytest.raises(SchedulerError, match="261"):
-        si.windows_tr(UV_WIN, "C:\\" + "x" * 250, "run", "rent")
+        si.windows_tr(UV_WIN, "C:\\" + "x" * 250, "run", "rent", window=window)
 
 
 def test_windows_install_replaces_stale_and_uninstall(monkeypatch):
